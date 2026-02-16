@@ -1,0 +1,15 @@
+name: httpbin
+base_url: https://httpbin.org
+endpoints:
+  - /get
+  - /post
+  - /put
+  - /delete
+  - /patch
+  - /headers
+  - /ip
+  - /user-agent
+  - /status/{code}
+  - /delay/{seconds}
+headers:
+  User-Agent: apish/0.1.0
