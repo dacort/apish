@@ -10,6 +10,7 @@ A filesystem-like interactive shell for exploring and testing REST APIs. Navigat
 - **Autocomplete** - Tab completion for commands and paths (coming soon)
 - **Pretty Output** - Color-coded status codes and formatted JSON responses
 - **Authentication** - Support for Bearer tokens, API keys, and Basic auth
+- **Ad-hoc Mode** - Point at any URL and start exploring immediately with `--endpoint`
 - **Extensible** - Easy to add new APIs via YAML configs
 
 ## Installation
@@ -77,6 +78,58 @@ jsonplaceholder:/users > get /1
 ...
 ```
 
+## Ad-hoc Mode
+
+Don't have a config file? No problem. Use `--endpoint` to point apish at any URL and start exploring immediately:
+
+```
+$ apish --endpoint https://fake-data.fly.dev/api
+🐚 apish - Interactive API Shell
+Type 'help' for available commands, 'exit' to quit
+
+✓ Connected to fake-data.fly.dev (https://fake-data.fly.dev/api)
+
+fake-data.fly.dev:/ > get /faker.json
+→ GET /faker.json
+200 OK
+
+{
+  "name": "Marge Gutkowski",
+  "email": "marge.gutkowski@example.net",
+  ...
+}
+
+fake-data.fly.dev:/ > get /template/cloudfront_log?num_rows=2
+→ GET /template/cloudfront_log?num_rows=2
+200 OK
+
+...
+
+fake-data.fly.dev:/ > ls
+Configured endpoints:
+  /faker.json
+  /template/cloudfront_log?num_rows=2
+
+fake-data.fly.dev:/ > :w fake-data.yaml
+✓ Saved config to fake-data.yaml
+```
+
+Successful requests (2xx) automatically show up in `ls`. When you're done exploring, `:w` saves everything to a reusable YAML config file:
+
+```yaml
+name: fake-data.fly.dev
+base_url: https://fake-data.fly.dev/api
+endpoints:
+- /faker.json
+- /template/cloudfront_log?num_rows=2
+```
+
+You can also set a custom name with `--name`:
+
+```bash
+apish --endpoint https://fake-data.fly.dev/api --name fakedata
+```
+
 ## Commands
 
 ### Navigation
@@ -96,6 +149,7 @@ jsonplaceholder:/users > get /1
 ### Utilities
 - `history` - Show request history
 - `config` - Show current API configuration
+- `:w <file>` - Save current API config to a YAML file
 - `help` - Show help
 - `exit` - Exit the shell
 
@@ -175,6 +229,7 @@ headers:
 - [x] Request history
 - [x] HTTP methods (GET, POST, PUT, PATCH, DELETE)
 - [x] Authentication (Bearer, API Key, Basic)
+- [x] Ad-hoc endpoint mode (`--endpoint`)
 - [ ] Tab autocomplete for paths
 - [ ] OpenAPI 3.1 spec loading
 - [ ] Request body from file
