@@ -71,6 +71,7 @@ impl ReplContext {
             "patch" | "PATCH" => self.http_request("PATCH", &parts[1..])?,
             "history" => self.show_history(),
             "config" => self.show_config()?,
+            ":w" => self.save_config(&parts[1..])?,
             _ => println!("{} Unknown command: {}. Type 'help' for available commands.", "✗".red(), parts[0]),
         }
 
@@ -95,6 +96,7 @@ impl ReplContext {
         println!();
         println!("  {} - Show request history", "history".yellow());
         println!("  {} - Show current API configuration", "config".yellow());
+        println!("  {} - Save current API config to a YAML file", ":w <file>".yellow());
         println!("  {}  - Exit the shell", "exit".yellow());
         println!();
     }
@@ -237,6 +239,15 @@ impl ReplContext {
         let status_code = response.status_code;
         response.print();
 
+        // Auto-add successful paths to endpoints
+        if (200..300).contains(&status_code) {
+            if let Some(config) = self.apis.get_mut(api_name) {
+                if !config.endpoints.contains(&path) {
+                    config.endpoints.push(path.clone());
+                }
+            }
+        }
+
         // Save to history
         self.history.add_entry(
             api_name.clone(),
@@ -294,10 +305,39 @@ impl ReplContext {
         println!();
         Ok(())
     }
+
+    fn save_config(&self, args: &[&str]) -> Result<()> {
+        let api_name = self.current_api.as_ref()
+            .ok_or_else(|| anyhow!("No API selected. Nothing to save."))?;
+
+        let config = self.apis.get(api_name).unwrap();
+
+        if args.is_empty() {
+            return Err(anyhow!("Usage: :w <filename>"));
+        }
+
+        let mut filename = args[0].to_string();
+        if !filename.ends_with(".yaml") && !filename.ends_with(".yml") {
+            filename.push_str(".yaml");
+        }
+
+        let path = std::path::Path::new(&filename);
+        config.save_to_file(path)?;
+        println!("{} Saved config to {}", "✓".green(), filename);
+        Ok(())
+    }
 }
 
-pub fn start(config_dir: PathBuf) -> Result<()> {
+pub fn start(config_dir: PathBuf, adhoc_api: Option<ApiConfig>) -> Result<()> {
     let mut ctx = ReplContext::new(config_dir)?;
+
+    // If ad-hoc API provided, insert it and set as current
+    if let Some(config) = adhoc_api {
+        let name = config.name.clone();
+        println!("{} Connected to {} ({})", "✓".green(), name.cyan().bold(), config.base_url);
+        ctx.apis.insert(name.clone(), config);
+        ctx.current_api = Some(name);
+    }
 
     let config = Config::builder()
         .completion_type(CompletionType::List)
