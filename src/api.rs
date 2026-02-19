@@ -12,9 +12,7 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new(config: ApiConfig) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
 
         Ok(Self { client, config })
     }
@@ -48,11 +46,17 @@ impl ApiClient {
         if let Some(auth) = &self.config.auth {
             req = match auth {
                 AuthConfig::Bearer { token } => req.bearer_auth(token),
-                AuthConfig::ApiKey { name, value, location } => match location {
+                AuthConfig::ApiKey {
+                    name,
+                    value,
+                    location,
+                } => match location {
                     KeyLocation::Header => req.header(name, value),
                     KeyLocation::Query => req.query(&[(name, value)]),
                 },
-                AuthConfig::Basic { username, password } => req.basic_auth(username, Some(password)),
+                AuthConfig::Basic { username, password } => {
+                    req.basic_auth(username, Some(password))
+                }
             };
         }
 
@@ -65,7 +69,9 @@ impl ApiClient {
         // Add body for POST/PUT/PATCH
         if let Some(body_str) = body {
             if !body_str.is_empty() {
-                req = req.header("Content-Type", "application/json").body(body_str.to_string());
+                req = req
+                    .header("Content-Type", "application/json")
+                    .body(body_str.to_string());
             }
         }
 
@@ -107,7 +113,8 @@ impl ApiResponse {
             "red"
         };
 
-        println!("{} {}",
+        println!(
+            "{} {}",
             format!("{}", self.status_code).color(status_color).bold(),
             self.status_text.color(status_color)
         );

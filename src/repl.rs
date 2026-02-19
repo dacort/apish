@@ -1,11 +1,118 @@
 use crate::api::ApiClient;
 use crate::config::{ApiConfig, History};
+use crate::openapi::{self, EndpointInfo};
 use anyhow::{Result, anyhow};
 use colored::Colorize;
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::{DefaultEditor, Config, CompletionType};
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{CompletionType, Config, Context, Editor, Helper};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+const COMMANDS: &[&str] = &[
+    "help", "exit", "quit", "apis", "use", "cd", "pwd", "ls", "get", "post", "put", "delete",
+    "patch", "GET", "POST", "PUT", "DELETE", "PATCH", "history", "config", ":w",
+];
+
+const HTTP_COMMANDS: &[&str] = &[
+    "get", "post", "put", "delete", "patch", "GET", "POST", "PUT", "DELETE", "PATCH",
+];
+
+#[derive(Clone)]
+struct CompletionState {
+    endpoint_paths: Vec<String>,
+    api_names: Vec<String>,
+}
+
+struct ApiHelper {
+    state: Arc<Mutex<CompletionState>>,
+}
+
+impl Completer for ApiHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let line_up_to_cursor = &line[..pos];
+        let parts: Vec<&str> = line_up_to_cursor.split_whitespace().collect();
+
+        let state = self.state.lock().unwrap();
+
+        // Complete command names
+        if parts.is_empty() || (parts.len() == 1 && !line_up_to_cursor.ends_with(' ')) {
+            let prefix = parts.first().copied().unwrap_or("");
+            let matches: Vec<Pair> = COMMANDS
+                .iter()
+                .filter(|cmd| cmd.starts_with(prefix))
+                .map(|cmd| Pair {
+                    display: cmd.to_string(),
+                    replacement: cmd.to_string(),
+                })
+                .collect();
+            return Ok((0, matches));
+        }
+
+        let cmd = parts[0];
+
+        // Complete API names after "use"
+        if cmd == "use" {
+            let prefix = if parts.len() > 1 && !line_up_to_cursor.ends_with(' ') {
+                parts[1]
+            } else {
+                ""
+            };
+            let start = line_up_to_cursor.rfind(prefix).unwrap_or(pos);
+            let matches: Vec<Pair> = state
+                .api_names
+                .iter()
+                .filter(|name| name.starts_with(prefix))
+                .map(|name| Pair {
+                    display: name.clone(),
+                    replacement: name.clone(),
+                })
+                .collect();
+            return Ok((start, matches));
+        }
+
+        // Complete endpoint paths after HTTP commands
+        if HTTP_COMMANDS.contains(&cmd) || cmd == "cd" {
+            let prefix = if parts.len() > 1 && !line_up_to_cursor.ends_with(' ') {
+                parts[1]
+            } else {
+                ""
+            };
+            let start = line_up_to_cursor.rfind(prefix).unwrap_or(pos);
+            let matches: Vec<Pair> = state
+                .endpoint_paths
+                .iter()
+                .filter(|path| path.starts_with(prefix))
+                .map(|path| Pair {
+                    display: path.clone(),
+                    replacement: path.clone(),
+                })
+                .collect();
+            return Ok((start, matches));
+        }
+
+        Ok((pos, Vec::new()))
+    }
+}
+
+impl Hinter for ApiHelper {
+    type Hint = String;
+}
+
+impl Highlighter for ApiHelper {}
+impl Validator for ApiHelper {}
+impl Helper for ApiHelper {}
 
 pub struct ReplContext {
     config_dir: PathBuf,
@@ -13,10 +120,12 @@ pub struct ReplContext {
     current_api: Option<String>,
     current_path: String,
     history: History,
+    openapi_endpoints: HashMap<String, Vec<EndpointInfo>>,
+    completion_state: Arc<Mutex<CompletionState>>,
 }
 
 impl ReplContext {
-    pub fn new(config_dir: PathBuf) -> Result<Self> {
+    fn new(config_dir: PathBuf, completion_state: Arc<Mutex<CompletionState>>) -> Result<Self> {
         // Load all API configs
         let mut apis = HashMap::new();
         let configs = ApiConfig::load_all_from_dir(&config_dir)?;
@@ -26,7 +135,15 @@ impl ReplContext {
 
         // Load history
         let history_path = config_dir.join("history.json");
-        let history = History::load(&history_path).unwrap_or_else(|_| History { entries: Vec::new() });
+        let history = History::load(&history_path).unwrap_or_else(|_| History {
+            entries: Vec::new(),
+        });
+
+        // Update completion state with API names
+        {
+            let mut state = completion_state.lock().unwrap();
+            state.api_names = apis.keys().cloned().collect();
+        }
 
         Ok(Self {
             config_dir,
@@ -34,6 +151,8 @@ impl ReplContext {
             current_api: None,
             current_path: "/".to_string(),
             history,
+            openapi_endpoints: HashMap::new(),
+            completion_state,
         })
     }
 
@@ -72,7 +191,11 @@ impl ReplContext {
             "history" => self.show_history(),
             "config" => self.show_config()?,
             ":w" => self.save_config(&parts[1..])?,
-            _ => println!("{} Unknown command: {}. Type 'help' for available commands.", "✗".red(), parts[0]),
+            _ => println!(
+                "{} Unknown command: {}. Type 'help' for available commands.",
+                "✗".red(),
+                parts[0]
+            ),
         }
 
         Ok(true)
@@ -83,29 +206,52 @@ impl ReplContext {
         println!();
         println!("  {}  - Display this help message", "help".yellow());
         println!("  {}  - List available APIs", "apis".yellow());
-        println!("  {}  - Switch to an API (e.g., 'use github')", "use <api>".yellow());
-        println!("  {}   - Change current path (e.g., 'cd /users')", "cd <path>".yellow());
+        println!(
+            "  {}  - Switch to an API (e.g., 'use github')",
+            "use <api>".yellow()
+        );
+        println!(
+            "  {}   - Change current path (e.g., 'cd /users')",
+            "cd <path>".yellow()
+        );
         println!("  {}   - Show current path", "pwd".yellow());
-        println!("  {}    - List available endpoints for current API", "ls".yellow());
+        println!(
+            "  {}    - List available endpoints for current API",
+            "ls".yellow()
+        );
         println!();
         println!("  {}  - Make a GET request", "get <path>".yellow());
-        println!("  {} - Make a POST request with JSON body", "post <path> <json>".yellow());
-        println!("  {}  - Make a PUT request with JSON body", "put <path> <json>".yellow());
-        println!("  {} - Make a PATCH request with JSON body", "patch <path> <json>".yellow());
+        println!(
+            "  {} - Make a POST request with JSON body",
+            "post <path> <json>".yellow()
+        );
+        println!(
+            "  {}  - Make a PUT request with JSON body",
+            "put <path> <json>".yellow()
+        );
+        println!(
+            "  {} - Make a PATCH request with JSON body",
+            "patch <path> <json>".yellow()
+        );
         println!("  {} - Make a DELETE request", "delete <path>".yellow());
         println!();
         println!("  {} - Show request history", "history".yellow());
         println!("  {} - Show current API configuration", "config".yellow());
-        println!("  {} - Save current API config to a YAML file", ":w <file>".yellow());
+        println!(
+            "  {} - Save current API config to a YAML file",
+            ":w <file>".yellow()
+        );
         println!("  {}  - Exit the shell", "exit".yellow());
         println!();
     }
 
     fn list_apis(&self) {
         if self.apis.is_empty() {
-            println!("{} No APIs configured. Add YAML config files to {}",
+            println!(
+                "{} No APIs configured. Add YAML config files to {}",
                 "ℹ".blue(),
-                self.config_dir.display());
+                self.config_dir.display()
+            );
             println!();
             println!("Example config:");
             println!("---");
@@ -136,13 +282,81 @@ impl ReplContext {
 
         let api_name = args[0];
         if !self.apis.contains_key(api_name) {
-            return Err(anyhow!("API '{}' not found. Use 'apis' to list available APIs.", api_name));
+            return Err(anyhow!(
+                "API '{}' not found. Use 'apis' to list available APIs.",
+                api_name
+            ));
         }
 
         self.current_api = Some(api_name.to_string());
         self.current_path = "/".to_string();
-        println!("{} Switched to API: {}", "✓".green(), api_name.cyan().bold());
+        println!(
+            "{} Switched to API: {}",
+            "✓".green(),
+            api_name.cyan().bold()
+        );
+
+        // Load OpenAPI spec if configured and not already loaded
+        self.load_openapi_for_api(api_name);
+
         Ok(())
+    }
+
+    fn load_openapi_for_api(&mut self, api_name: &str) {
+        if self.openapi_endpoints.contains_key(api_name) {
+            self.update_completion_state();
+            return;
+        }
+
+        let openapi_url = {
+            let config = self.apis.get(api_name).unwrap();
+            config.openapi.clone()
+        };
+
+        if let Some(url) = openapi_url {
+            println!("{} Loading OpenAPI spec from {}...", "ℹ".blue(), url);
+            match openapi::fetch_and_parse(&url) {
+                Ok((_, endpoints)) => {
+                    println!(
+                        "{} Loaded {} endpoints from OpenAPI spec",
+                        "✓".green(),
+                        endpoints.len()
+                    );
+                    self.openapi_endpoints
+                        .insert(api_name.to_string(), endpoints);
+                    self.update_completion_state();
+                }
+                Err(e) => {
+                    println!("{} Failed to load OpenAPI spec: {}", "✗".red(), e);
+                }
+            }
+        }
+    }
+
+    fn update_completion_state(&self) {
+        let mut paths = Vec::new();
+
+        if let Some(api_name) = &self.current_api {
+            // Add OpenAPI endpoint paths
+            if let Some(endpoints) = self.openapi_endpoints.get(api_name) {
+                for ep in endpoints {
+                    paths.push(ep.path.clone());
+                }
+            }
+
+            // Add configured endpoint paths
+            if let Some(config) = self.apis.get(api_name) {
+                for ep in &config.endpoints {
+                    if !paths.contains(ep) {
+                        paths.push(ep.clone());
+                    }
+                }
+            }
+        }
+
+        let mut state = self.completion_state.lock().unwrap();
+        state.endpoint_paths = paths;
+        state.api_names = self.apis.keys().cloned().collect();
     }
 
     fn change_path(&mut self, args: &[&str]) -> Result<()> {
@@ -156,7 +370,11 @@ impl ReplContext {
             self.current_path = path.to_string();
         } else if path == ".." {
             // Go up one level
-            let parts: Vec<&str> = self.current_path.trim_end_matches('/').rsplitn(2, '/').collect();
+            let parts: Vec<&str> = self
+                .current_path
+                .trim_end_matches('/')
+                .rsplitn(2, '/')
+                .collect();
             self.current_path = if parts.len() > 1 {
                 parts[1].to_string()
             } else {
@@ -177,9 +395,54 @@ impl ReplContext {
     }
 
     fn list_endpoints(&self) -> Result<()> {
-        let api_name = self.current_api.as_ref()
+        let api_name = self
+            .current_api
+            .as_ref()
             .ok_or_else(|| anyhow!("No API selected. Use 'use <api>' first."))?;
 
+        // Show OpenAPI endpoints if available
+        if let Some(endpoints) = self.openapi_endpoints.get(api_name) {
+            println!("{}", "Endpoints (from OpenAPI spec):".bold());
+            for ep in endpoints {
+                for method in &ep.methods {
+                    let params: Vec<String> = method
+                        .parameters
+                        .iter()
+                        .map(|p| {
+                            if p.required {
+                                format!("{}*", p.name)
+                            } else {
+                                p.name.clone()
+                            }
+                        })
+                        .collect();
+
+                    let param_str = if params.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", params.join(", "))
+                    };
+
+                    let summary_str = method
+                        .summary
+                        .as_ref()
+                        .map(|s| format!(" - {}", s))
+                        .unwrap_or_default();
+
+                    println!(
+                        "  {:6} {}{}{}",
+                        method.method.yellow(),
+                        ep.path.green(),
+                        param_str.normal(),
+                        summary_str.dimmed(),
+                    );
+                }
+            }
+            println!();
+            return Ok(());
+        }
+
+        // Fall back to flat endpoint list
         let config = self.apis.get(api_name).unwrap();
 
         if config.endpoints.is_empty() {
@@ -208,7 +471,9 @@ impl ReplContext {
     }
 
     fn http_request(&mut self, method: &str, args: &[&str]) -> Result<()> {
-        let api_name = self.current_api.as_ref()
+        let api_name = self
+            .current_api
+            .as_ref()
             .ok_or_else(|| anyhow!("No API selected. Use 'use <api>' first."))?;
 
         let config = self.apis.get(api_name).unwrap();
@@ -268,10 +533,12 @@ impl ReplContext {
 
         println!("{}", "Recent requests (last 20):".bold());
         for entry in self.history.entries.iter().rev().take(20) {
-            let status = entry.status_code
+            let status = entry
+                .status_code
                 .map(|s| format!("{}", s))
                 .unwrap_or_else(|| "---".to_string());
-            println!("  {} {} {} ({})",
+            println!(
+                "  {} {} {} ({})",
                 entry.api.cyan(),
                 entry.method.yellow(),
                 entry.path.green(),
@@ -282,7 +549,9 @@ impl ReplContext {
     }
 
     fn show_config(&self) -> Result<()> {
-        let api_name = self.current_api.as_ref()
+        let api_name = self
+            .current_api
+            .as_ref()
             .ok_or_else(|| anyhow!("No API selected. Use 'use <api>' first."))?;
 
         let config = self.apis.get(api_name).unwrap();
@@ -290,6 +559,10 @@ impl ReplContext {
         println!("{}", "Current API Configuration:".bold());
         println!("  Name: {}", config.name.cyan());
         println!("  Base URL: {}", config.base_url.green());
+
+        if let Some(openapi_url) = &config.openapi {
+            println!("  OpenAPI: {}", openapi_url);
+        }
 
         if !config.headers.is_empty() {
             println!("  Headers:");
@@ -307,7 +580,9 @@ impl ReplContext {
     }
 
     fn save_config(&self, args: &[&str]) -> Result<()> {
-        let api_name = self.current_api.as_ref()
+        let api_name = self
+            .current_api
+            .as_ref()
             .ok_or_else(|| anyhow!("No API selected. Nothing to save."))?;
 
         let config = self.apis.get(api_name).unwrap();
@@ -329,21 +604,39 @@ impl ReplContext {
 }
 
 pub fn start(config_dir: PathBuf, adhoc_api: Option<ApiConfig>) -> Result<()> {
-    let mut ctx = ReplContext::new(config_dir)?;
+    let completion_state = Arc::new(Mutex::new(CompletionState {
+        endpoint_paths: Vec::new(),
+        api_names: Vec::new(),
+    }));
+
+    let mut ctx = ReplContext::new(config_dir, Arc::clone(&completion_state))?;
 
     // If ad-hoc API provided, insert it and set as current
     if let Some(config) = adhoc_api {
         let name = config.name.clone();
-        println!("{} Connected to {} ({})", "✓".green(), name.cyan().bold(), config.base_url);
+        println!(
+            "{} Connected to {} ({})",
+            "✓".green(),
+            name.cyan().bold(),
+            config.base_url
+        );
         ctx.apis.insert(name.clone(), config);
-        ctx.current_api = Some(name);
+        ctx.current_api = Some(name.clone());
+
+        // Load OpenAPI spec if configured
+        ctx.load_openapi_for_api(&name);
     }
 
-    let config = Config::builder()
+    let rl_config = Config::builder()
         .completion_type(CompletionType::List)
         .build();
 
-    let mut rl = DefaultEditor::with_config(config)?;
+    let helper = ApiHelper {
+        state: Arc::clone(&completion_state),
+    };
+
+    let mut rl = Editor::with_config(rl_config)?;
+    rl.set_helper(Some(helper));
 
     // Load readline history
     let history_file = ctx.config_dir.join("readline_history.txt");
