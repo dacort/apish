@@ -1,7 +1,7 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use anyhow::{Result, Context};
-use std::path::{Path, PathBuf};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
@@ -9,6 +9,8 @@ pub struct ApiConfig {
     pub base_url: String,
     #[serde(default)]
     pub endpoints: Vec<String>,
+    #[serde(default)]
+    pub openapi: Option<String>,
     #[serde(default)]
     pub auth: Option<AuthConfig>,
     #[serde(default)]
@@ -18,9 +20,18 @@ pub struct ApiConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum AuthConfig {
-    Bearer { token: String },
-    ApiKey { name: String, value: String, location: KeyLocation },
-    Basic { username: String, password: String },
+    Bearer {
+        token: String,
+    },
+    ApiKey {
+        name: String,
+        value: String,
+        location: KeyLocation,
+    },
+    Basic {
+        username: String,
+        password: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,8 +46,7 @@ impl ApiConfig {
         let content = std::fs::read_to_string(path)
             .context(format!("Failed to read config from {:?}", path))?;
 
-        serde_yaml::from_str(&content)
-            .context("Failed to parse YAML config")
+        serde_yaml::from_str(&content).context("Failed to parse YAML config")
     }
 
     pub fn load_all_from_dir(dir: &Path) -> Result<Vec<Self>> {
@@ -51,7 +61,8 @@ impl ApiConfig {
             let path = entry.path();
 
             if path.extension().and_then(|s| s.to_str()) == Some("yaml")
-                || path.extension().and_then(|s| s.to_str()) == Some("yml") {
+                || path.extension().and_then(|s| s.to_str()) == Some("yml")
+            {
                 match Self::load_from_file(&path) {
                     Ok(config) => configs.push(config),
                     Err(e) => eprintln!("Warning: Failed to load {:?}: {}", path, e),
@@ -86,7 +97,9 @@ pub struct HistoryEntry {
 impl History {
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
-            return Ok(Self { entries: Vec::new() });
+            return Ok(Self {
+                entries: Vec::new(),
+            });
         }
 
         let content = std::fs::read_to_string(path)?;
@@ -99,7 +112,13 @@ impl History {
         Ok(())
     }
 
-    pub fn add_entry(&mut self, api: String, method: String, path: String, status_code: Option<u16>) {
+    pub fn add_entry(
+        &mut self,
+        api: String,
+        method: String,
+        path: String,
+        status_code: Option<u16>,
+    ) {
         self.entries.push(HistoryEntry {
             api,
             method,

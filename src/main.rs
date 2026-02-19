@@ -1,6 +1,7 @@
-mod config;
-mod repl;
 mod api;
+mod config;
+mod openapi;
+mod repl;
 
 use anyhow::Result;
 use clap::Parser;
@@ -39,16 +40,54 @@ fn main() -> Result<()> {
         let url = Url::parse(&endpoint)
             .map_err(|e| anyhow::anyhow!("Invalid endpoint URL '{}': {}", endpoint, e))?;
 
-        let name = cli.name.unwrap_or_else(|| {
-            url.host_str().unwrap_or("adhoc").to_string()
-        });
+        // Try to detect if the endpoint is an OpenAPI spec
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
 
-        let base_url = endpoint.trim_end_matches('/').to_string();
+        let mut openapi_url = None;
+        let mut base_url = endpoint.trim_end_matches('/').to_string();
+
+        if let Ok(response) = client.get(&endpoint).send()
+            && let Ok(body) = response.text()
+            && openapi::is_openapi_spec(&body)
+        {
+            openapi_url = Some(endpoint.clone());
+
+            // Derive base_url from the spec's servers field, or fall back to the URL's origin
+            let origin = {
+                let port_suffix = url.port().map(|p| format!(":{}", p)).unwrap_or_default();
+                format!(
+                    "{}://{}{}",
+                    url.scheme(),
+                    url.host_str().unwrap_or("localhost"),
+                    port_suffix
+                )
+            };
+
+            if let Ok((Some(server), _)) = openapi::parse_spec(&body) {
+                if server.starts_with("http://") || server.starts_with("https://") {
+                    base_url = server.trim_end_matches('/').to_string();
+                } else {
+                    // Relative server URL — resolve against the spec URL origin
+                    base_url =
+                        format!("{}{}", origin, server.trim_end_matches('/'));
+                }
+            } else {
+                // No servers in spec — use the origin of the spec URL
+                base_url = origin;
+            }
+        }
+
+        let name = cli
+            .name
+            .unwrap_or_else(|| url.host_str().unwrap_or("adhoc").to_string());
 
         Some(ApiConfig {
             name,
             base_url,
             endpoints: Vec::new(),
+            openapi: openapi_url,
             auth: None,
             headers: std::collections::HashMap::new(),
         })

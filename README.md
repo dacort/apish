@@ -7,7 +7,8 @@ A filesystem-like interactive shell for exploring and testing REST APIs. Navigat
 - **Interactive REPL** - Navigate APIs like a filesystem with familiar commands (`cd`, `ls`, `pwd`)
 - **YAML Configuration** - Define APIs with simple YAML files
 - **Request History** - All requests are tracked and previously accessed paths are suggested
-- **Autocomplete** - Tab completion for commands and paths (coming soon)
+- **OpenAPI 3.1 Support** - Auto-detect OpenAPI specs to populate endpoints, methods, and parameters
+- **Autocomplete** - Tab completion for commands, API names, and endpoint paths
 - **Pretty Output** - Color-coded status codes and formatted JSON responses
 - **Authentication** - Support for Bearer tokens, API keys, and Basic auth
 - **Ad-hoc Mode** - Point at any URL and start exploring immediately with `--endpoint`
@@ -130,6 +131,40 @@ You can also set a custom name with `--name`:
 apish --endpoint https://fake-data.fly.dev/api --name fakedata
 ```
 
+## OpenAPI Support
+
+Point apish at an OpenAPI 3.1 spec URL and it automatically discovers all endpoints, HTTP methods, and parameters:
+
+```
+$ apish --endpoint https://fake-data.fly.dev/openapi.json
+🐚 apish - Interactive API Shell
+Type 'help' for available commands, 'exit' to quit
+
+✓ Connected to fake-data.fly.dev (https://fake-data.fly.dev)
+ℹ Loading OpenAPI spec from https://fake-data.fly.dev/openapi.json...
+✓ Loaded 5 endpoints from OpenAPI spec
+
+fake-data.fly.dev:/ > ls
+Endpoints (from OpenAPI spec):
+  GET    /healthcheck
+  GET    /api/faker.json (num_rows, col_types, col_headers, seed)
+  GET    /api/faker.csv (num_rows, col_types, col_headers, seed)
+  GET    /api/template/{template_name} (template_name*, num_rows)
+  GET    /openapi.json
+```
+
+Parameters marked with `*` are required. Tab completion works with spec-discovered paths too.
+
+You can also reference an OpenAPI spec in a YAML config file:
+
+```yaml
+name: fakedata
+base_url: https://fake-data.fly.dev
+openapi: https://fake-data.fly.dev/openapi.json
+```
+
+The spec is fetched when you `use` the API, and endpoints from the spec are displayed alongside any manually configured ones.
+
 ## Commands
 
 ### Navigation
@@ -230,8 +265,8 @@ headers:
 - [x] HTTP methods (GET, POST, PUT, PATCH, DELETE)
 - [x] Authentication (Bearer, API Key, Basic)
 - [x] Ad-hoc endpoint mode (`--endpoint`)
-- [ ] Tab autocomplete for paths
-- [ ] OpenAPI 3.1 spec loading
+- [x] Tab autocomplete for paths
+- [x] OpenAPI 3.1 spec loading
 - [ ] Request body from file
 - [ ] Response saving to file
 - [ ] Environment variables in configs
