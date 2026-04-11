@@ -253,6 +253,143 @@ pub fn parse_introspection(body: &str) -> Result<GraphQLSchema> {
     })
 }
 
+use crate::config::{AuthConfig, KeyLocation};
+use reqwest::blocking::Client;
+use std::collections::HashMap as StdHashMap;
+use std::time::Duration;
+
+pub const INTROSPECTION_QUERY: &str = r#"{
+  __schema {
+    queryType { name }
+    mutationType { name }
+    types {
+      kind
+      name
+      fields(includeDeprecated: true) {
+        name
+        description
+        args {
+          name
+          type { ...TypeRef }
+          defaultValue
+        }
+        type { ...TypeRef }
+      }
+      inputFields {
+        name
+        type { ...TypeRef }
+        defaultValue
+      }
+      enumValues(includeDeprecated: true) { name }
+    }
+  }
+}
+
+fragment TypeRef on __Type {
+  kind
+  name
+  ofType {
+    kind
+    name
+    ofType {
+      kind
+      name
+      ofType {
+        kind
+        name
+        ofType {
+          kind
+          name
+          ofType {
+            kind
+            name
+            ofType {
+              kind
+              name
+              ofType {
+                kind
+                name
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}"#;
+
+/// Fetches the schema from a GraphQL endpoint by POSTing the introspection query.
+pub fn fetch_schema(
+    url: &str,
+    headers: &StdHashMap<String, String>,
+    auth: Option<&AuthConfig>,
+) -> Result<GraphQLSchema> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    let mut req = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(format!(
+            "{{\"query\": {}}}",
+            serde_json::to_string(INTROSPECTION_QUERY)?
+        ));
+
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+
+    if let Some(auth) = auth {
+        req = match auth {
+            AuthConfig::Bearer { token } => req.bearer_auth(token),
+            AuthConfig::ApiKey { name, value, location } => match location {
+                KeyLocation::Header => req.header(name, value),
+                KeyLocation::Query => req.query(&[(name, value)]),
+            },
+            AuthConfig::Basic { username, password } => req.basic_auth(username, Some(password)),
+        };
+    }
+
+    let response = req.send()?;
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "introspection failed with status {}",
+            response.status()
+        ));
+    }
+
+    let body = response.text()?;
+    parse_introspection(&body)
+}
+
+/// Quick check: does this URL respond to a GraphQL introspection query with a valid schema?
+pub fn detect_graphql(url: &str) -> bool {
+    let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let body = format!("{{\"query\": \"{{ __schema {{ queryType {{ name }} }} }}\"}}");
+    let resp = match client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+    {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let text = match resp.text() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    // Look for the structural marker
+    text.contains("\"__schema\"") && text.contains("\"queryType\"")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
