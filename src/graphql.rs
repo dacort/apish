@@ -84,6 +84,175 @@ impl TypeRef {
     }
 }
 
+// ----- Raw introspection JSON shapes (for serde) -----
+
+#[derive(Debug, Deserialize)]
+struct IntrospectionRoot {
+    data: IntrospectionData,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntrospectionData {
+    #[serde(rename = "__schema")]
+    schema: IntrospectionSchema,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntrospectionSchema {
+    #[serde(rename = "queryType")]
+    query_type: IntrospectionTypeName,
+    #[serde(rename = "mutationType")]
+    mutation_type: Option<IntrospectionTypeName>,
+    types: Vec<IntrospectionType>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntrospectionTypeName {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntrospectionType {
+    kind: String,
+    name: Option<String>,
+    fields: Option<Vec<IntrospectionField>>,
+    #[serde(rename = "inputFields")]
+    input_fields: Option<Vec<IntrospectionInputField>>,
+    #[serde(rename = "enumValues")]
+    enum_values: Option<Vec<IntrospectionEnumValue>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntrospectionField {
+    name: String,
+    description: Option<String>,
+    args: Vec<IntrospectionInputField>,
+    #[serde(rename = "type")]
+    type_ref: IntrospectionTypeRef,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntrospectionInputField {
+    name: String,
+    #[serde(rename = "type")]
+    type_ref: IntrospectionTypeRef,
+    #[serde(rename = "defaultValue")]
+    default_value: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntrospectionEnumValue {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntrospectionTypeRef {
+    kind: String,
+    name: Option<String>,
+    #[serde(rename = "ofType")]
+    of_type: Option<Box<IntrospectionTypeRef>>,
+}
+
+// ----- Conversion -----
+
+fn parse_kind(s: &str) -> Result<TypeKind> {
+    Ok(match s {
+        "SCALAR" => TypeKind::Scalar,
+        "OBJECT" => TypeKind::Object,
+        "INTERFACE" => TypeKind::Interface,
+        "UNION" => TypeKind::Union,
+        "ENUM" => TypeKind::Enum,
+        "INPUT_OBJECT" => TypeKind::InputObject,
+        "LIST" => TypeKind::List,
+        "NON_NULL" => TypeKind::NonNull,
+        other => return Err(anyhow!("unknown type kind: {}", other)),
+    })
+}
+
+fn convert_type_ref(t: &IntrospectionTypeRef) -> Result<TypeRef> {
+    Ok(TypeRef {
+        kind: parse_kind(&t.kind)?,
+        name: t.name.clone(),
+        of_type: match &t.of_type {
+            Some(inner) => Some(Box::new(convert_type_ref(inner)?)),
+            None => None,
+        },
+    })
+}
+
+fn convert_arg(a: &IntrospectionInputField) -> Result<ArgDef> {
+    Ok(ArgDef {
+        name: a.name.clone(),
+        type_ref: convert_type_ref(&a.type_ref)?,
+        default_value: a.default_value.clone(),
+    })
+}
+
+fn convert_input_field(f: &IntrospectionInputField) -> Result<InputFieldDef> {
+    Ok(InputFieldDef {
+        name: f.name.clone(),
+        type_ref: convert_type_ref(&f.type_ref)?,
+        default_value: f.default_value.clone(),
+    })
+}
+
+fn convert_field(f: &IntrospectionField) -> Result<FieldDef> {
+    Ok(FieldDef {
+        name: f.name.clone(),
+        description: f.description.clone(),
+        args: f.args.iter().map(convert_arg).collect::<Result<Vec<_>>>()?,
+        type_ref: convert_type_ref(&f.type_ref)?,
+    })
+}
+
+pub fn parse_introspection(body: &str) -> Result<GraphQLSchema> {
+    let root: IntrospectionRoot =
+        serde_json::from_str(body).map_err(|e| anyhow!("invalid introspection JSON: {}", e))?;
+
+    let mut types = HashMap::new();
+    for t in &root.data.schema.types {
+        let name = match &t.name {
+            Some(n) => n.clone(),
+            None => continue, // anonymous LIST/NON_NULL wrappers in the type list
+        };
+        let kind = parse_kind(&t.kind)?;
+        let fields = t
+            .fields
+            .as_ref()
+            .map(|fs| fs.iter().map(convert_field).collect::<Result<Vec<_>>>())
+            .transpose()?
+            .unwrap_or_default();
+        let input_fields = t
+            .input_fields
+            .as_ref()
+            .map(|fs| fs.iter().map(convert_input_field).collect::<Result<Vec<_>>>())
+            .transpose()?
+            .unwrap_or_default();
+        let enum_values = t
+            .enum_values
+            .as_ref()
+            .map(|vs| vs.iter().map(|v| v.name.clone()).collect())
+            .unwrap_or_default();
+
+        types.insert(
+            name.clone(),
+            TypeDef {
+                name,
+                kind,
+                fields,
+                input_fields,
+                enum_values,
+            },
+        );
+    }
+
+    Ok(GraphQLSchema {
+        query_type: root.data.schema.query_type.name,
+        mutation_type: root.data.schema.mutation_type.map(|m| m.name),
+        types,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +306,48 @@ mod tests {
             })),
         };
         assert_eq!(t.unwrap_name(), Some("Product"));
+    }
+
+    #[test]
+    fn parse_minimal_introspection() {
+        let json = r#"{
+          "data": {
+            "__schema": {
+              "queryType": { "name": "Query" },
+              "mutationType": null,
+              "types": [
+                {
+                  "kind": "OBJECT",
+                  "name": "Query",
+                  "fields": [
+                    {
+                      "name": "hello",
+                      "description": null,
+                      "args": [],
+                      "type": { "kind": "SCALAR", "name": "String", "ofType": null }
+                    }
+                  ],
+                  "inputFields": null,
+                  "enumValues": null
+                },
+                {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "fields": null,
+                  "inputFields": null,
+                  "enumValues": null
+                }
+              ]
+            }
+          }
+        }"#;
+
+        let schema = parse_introspection(json).unwrap();
+        assert_eq!(schema.query_type, "Query");
+        assert_eq!(schema.mutation_type, None);
+        let query_type = schema.types.get("Query").unwrap();
+        assert_eq!(query_type.fields.len(), 1);
+        assert_eq!(query_type.fields[0].name, "hello");
+        assert_eq!(query_type.fields[0].type_ref.render(), "String");
     }
 }
