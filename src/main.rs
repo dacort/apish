@@ -88,6 +88,7 @@ fn main() -> Result<()> {
             base_url,
             endpoints: Vec::new(),
             openapi: openapi_url,
+            graphql: None,
             auth: None,
             headers: std::collections::HashMap::new(),
         })

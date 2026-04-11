@@ -12,6 +12,8 @@ pub struct ApiConfig {
     #[serde(default)]
     pub openapi: Option<String>,
     #[serde(default)]
+    pub graphql: Option<bool>,
+    #[serde(default)]
     pub auth: Option<AuthConfig>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
