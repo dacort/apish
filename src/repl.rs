@@ -183,7 +183,15 @@ impl ReplContext {
             "exit" | "quit" => return Ok(false),
             "apis" => self.list_apis(),
             "use" => self.use_api(&parts[1..])?,
-            "cd" => self.change_path(&parts[1..])?,
+            "cd" => {
+                if let Some(api) = &self.current_api.clone()
+                    && self.is_graphql_api(api)
+                {
+                    self.change_graphql_path(&parts[1..])?;
+                } else {
+                    self.change_path(&parts[1..])?;
+                }
+            }
             "pwd" => println!("{}", self.current_path),
             "ls" => {
                 if let Some(api) = &self.current_api.clone()
@@ -457,6 +465,59 @@ impl ReplContext {
             self.current_path = new_path;
         }
 
+        Ok(())
+    }
+
+    fn change_graphql_path(&mut self, args: &[&str]) -> Result<()> {
+        let api_name = self
+            .current_api
+            .as_ref()
+            .ok_or_else(|| anyhow!("No API selected"))?
+            .clone();
+
+        let schema = self
+            .graphql_schemas
+            .get(&api_name)
+            .ok_or_else(|| anyhow!("GraphQL schema not loaded"))?;
+
+        let target_path = if args.is_empty() {
+            "/".to_string()
+        } else {
+            let arg = args[0];
+            if arg == "/" {
+                "/".to_string()
+            } else if arg == ".." {
+                let parts: Vec<&str> = self
+                    .current_path
+                    .trim_end_matches('/')
+                    .rsplitn(2, '/')
+                    .collect();
+                let mut p = if parts.len() > 1 {
+                    parts[1].to_string()
+                } else {
+                    "/".to_string()
+                };
+                if p.is_empty() {
+                    p = "/".to_string();
+                }
+                p
+            } else if arg.starts_with('/') {
+                arg.to_string()
+            } else {
+                let mut p = self.current_path.trim_end_matches('/').to_string();
+                p.push('/');
+                p.push_str(arg);
+                p
+            }
+        };
+
+        // Validate the path resolves
+        if crate::graphql::resolve_path(schema, &target_path).is_none() {
+            return Err(anyhow!("path does not exist in schema: {}", target_path));
+        }
+
+        self.current_path = target_path;
+        self.update_completion_state();
         Ok(())
     }
 
