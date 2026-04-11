@@ -47,6 +47,7 @@ fn main() -> Result<()> {
             .build()?;
 
         let mut openapi_url = None;
+        let mut graphql_flag: Option<bool> = None;
         let mut base_url = endpoint.trim_end_matches('/').to_string();
 
         if let Ok(response) = client.get(&endpoint).send()
@@ -55,7 +56,6 @@ fn main() -> Result<()> {
         {
             openapi_url = Some(endpoint.clone());
 
-            // Derive base_url from the spec's servers field, or fall back to the URL's origin
             let origin = {
                 let port_suffix = url.port().map(|p| format!(":{}", p)).unwrap_or_default();
                 format!(
@@ -70,14 +70,14 @@ fn main() -> Result<()> {
                 if server.starts_with("http://") || server.starts_with("https://") {
                     base_url = server.trim_end_matches('/').to_string();
                 } else {
-                    // Relative server URL — resolve against the spec URL origin
-                    base_url =
-                        format!("{}{}", origin, server.trim_end_matches('/'));
+                    base_url = format!("{}{}", origin, server.trim_end_matches('/'));
                 }
             } else {
-                // No servers in spec — use the origin of the spec URL
                 base_url = origin;
             }
+        } else if graphql::detect_graphql(&endpoint) {
+            graphql_flag = Some(true);
+            base_url = endpoint.clone();
         }
 
         let name = cli
@@ -89,7 +89,7 @@ fn main() -> Result<()> {
             base_url,
             endpoints: Vec::new(),
             openapi: openapi_url,
-            graphql: None,
+            graphql: graphql_flag,
             auth: None,
             headers: std::collections::HashMap::new(),
         })
