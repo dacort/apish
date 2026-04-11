@@ -274,65 +274,57 @@ pub fn parse_introspection(body: &str) -> Result<GraphQLSchema> {
     })
 }
 
-pub const INTROSPECTION_QUERY: &str = r#"{
-  __schema {
-    queryType { name }
-    mutationType { name }
-    types {
-      kind
-      name
-      fields(includeDeprecated: true) {
-        name
-        description
-        args {
-          name
-          type { ...TypeRef }
-          defaultValue
-        }
-        type { ...TypeRef }
-      }
-      inputFields {
-        name
-        type { ...TypeRef }
-        defaultValue
-      }
-      enumValues(includeDeprecated: true) { name }
+const DEFAULT_INTROSPECTION_TYPE_DEPTH: usize = 6;
+const SHALLOW_INTROSPECTION_TYPE_DEPTH: usize = 2;
+
+fn build_type_ref_query(depth: usize) -> String {
+    if depth == 0 {
+        return "kind name".to_string();
     }
-  }
+
+    format!(
+        "kind name ofType {{ {} }}",
+        build_type_ref_query(depth.saturating_sub(1))
+    )
 }
 
-fragment TypeRef on __Type {
-  kind
-  name
-  ofType {
-    kind
-    name
-    ofType {
+fn build_introspection_query(of_type_depth: usize) -> String {
+    let type_ref = build_type_ref_query(of_type_depth);
+    format!(
+        r#"{{
+  __schema {{
+    queryType {{ name }}
+    mutationType {{ name }}
+    types {{
       kind
       name
-      ofType {
-        kind
+      fields(includeDeprecated: true) {{
         name
-        ofType {
-          kind
+        description
+        args {{
           name
-          ofType {
-            kind
-            name
-            ofType {
-              kind
-              name
-              ofType {
-                kind
-                name
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}"#;
+          type {{ {type_ref} }}
+          defaultValue
+        }}
+        type {{ {type_ref} }}
+      }}
+      inputFields {{
+        name
+        type {{ {type_ref} }}
+        defaultValue
+      }}
+      enumValues(includeDeprecated: true) {{ name }}
+    }}
+  }}
+}}"#
+    )
+}
+
+fn is_query_depth_limit_error(status: u16, body_text: &str) -> bool {
+    status == 413
+        && (body_text.contains("Query depth limit exceeded")
+            || body_text.contains("GCDN_QUERY_DEPTH_LIMIT"))
+}
 
 #[derive(Debug)]
 struct GraphQLHttpResponse {
@@ -539,10 +531,18 @@ pub fn fetch_schema(
     headers: &HashMap<String, String>,
     auth: Option<&AuthConfig>,
 ) -> Result<GraphQLSchema> {
-    let payload = serde_json::json!({
-        "query": INTROSPECTION_QUERY,
+    let full_payload = serde_json::json!({
+        "query": build_introspection_query(DEFAULT_INTROSPECTION_TYPE_DEPTH),
     });
-    let response = post_graphql_json(url, headers, auth, &payload)?;
+    let response = post_graphql_json(url, headers, auth, &full_payload)?;
+    let response = if is_query_depth_limit_error(response.status, &response.body_text) {
+        let shallow_payload = serde_json::json!({
+            "query": build_introspection_query(SHALLOW_INTROSPECTION_TYPE_DEPTH),
+        });
+        post_graphql_json(url, headers, auth, &shallow_payload)?
+    } else {
+        response
+    };
     if response.status < 200 || response.status >= 300 {
         return Err(anyhow!(
             "introspection failed with status {}",
@@ -676,6 +676,121 @@ fn parse_scalar_value(raw: &str) -> Value {
     Value::String(raw.to_string())
 }
 
+fn coerce_value_for_type(
+    value: &Value,
+    type_ref: &TypeRef,
+    schema: &GraphQLSchema,
+) -> Result<Value> {
+    match type_ref.kind {
+        TypeKind::NonNull => {
+            let inner = type_ref
+                .of_type
+                .as_ref()
+                .ok_or_else(|| anyhow!("non-null type missing inner type"))?;
+            if value.is_null() {
+                return Err(anyhow!("expected non-null value"));
+            }
+            coerce_value_for_type(value, inner, schema)
+        }
+        TypeKind::List => {
+            let inner = type_ref
+                .of_type
+                .as_ref()
+                .ok_or_else(|| anyhow!("list type missing inner type"))?;
+            match value {
+                Value::Array(items) => Ok(Value::Array(
+                    items
+                        .iter()
+                        .map(|item| coerce_value_for_type(item, inner, schema))
+                        .collect::<Result<Vec<_>>>()?,
+                )),
+                _ => Err(anyhow!("expected a list value")),
+            }
+        }
+        _ => {
+            let type_name = type_ref.unwrap_name().unwrap_or_default();
+            match schema.types.get(type_name) {
+                Some(type_def) if matches!(type_def.kind, TypeKind::InputObject) => {
+                    coerce_input_object(value, type_def, schema)
+                }
+                Some(type_def) if matches!(type_def.kind, TypeKind::Enum) => {
+                    coerce_enum_value(value, type_def)
+                }
+                _ => coerce_scalar_value(value, type_name),
+            }
+        }
+    }
+}
+
+fn coerce_input_object(value: &Value, type_def: &TypeDef, schema: &GraphQLSchema) -> Result<Value> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| anyhow!("expected input object {}", type_def.name))?;
+
+    let mut out = Map::new();
+    for (key, raw_value) in obj {
+        let field_def = type_def
+            .input_fields
+            .iter()
+            .find(|f| f.name == *key)
+            .ok_or_else(|| anyhow!("'{}' is not a field on {}", key, type_def.name))?;
+        out.insert(
+            key.clone(),
+            coerce_value_for_type(raw_value, &field_def.type_ref, schema)
+                .map_err(|e| anyhow!("invalid value for {}.{}: {}", type_def.name, key, e))?,
+        );
+    }
+    Ok(Value::Object(out))
+}
+
+fn coerce_enum_value(value: &Value, type_def: &TypeDef) -> Result<Value> {
+    let s = value
+        .as_str()
+        .ok_or_else(|| anyhow!("expected enum value for {}", type_def.name))?;
+    if type_def.enum_values.iter().any(|v| v == s) {
+        Ok(Value::String(s.to_string()))
+    } else {
+        Err(anyhow!("invalid enum value '{}' for {}", s, type_def.name))
+    }
+}
+
+fn coerce_scalar_value(value: &Value, type_name: &str) -> Result<Value> {
+    match type_name {
+        "String" | "ID" => match value {
+            Value::String(s) => Ok(Value::String(s.clone())),
+            Value::Number(n) => Ok(Value::String(n.to_string())),
+            Value::Bool(b) => Ok(Value::String(b.to_string())),
+            Value::Null => Ok(Value::Null),
+            _ => Err(anyhow!("expected scalar {}", type_name)),
+        },
+        "Int" => match value {
+            Value::Number(n) if n.is_i64() || n.is_u64() => Ok(Value::Number(n.clone())),
+            Value::String(s) => {
+                let parsed = s.parse::<i64>().map_err(|_| anyhow!("expected integer"))?;
+                Ok(Value::Number(parsed.into()))
+            }
+            _ => Err(anyhow!("expected integer")),
+        },
+        "Float" => match value {
+            Value::Number(n) => Ok(Value::Number(n.clone())),
+            Value::String(s) => {
+                let parsed = s.parse::<f64>().map_err(|_| anyhow!("expected float"))?;
+                let num =
+                    serde_json::Number::from_f64(parsed).ok_or_else(|| anyhow!("invalid float"))?;
+                Ok(Value::Number(num))
+            }
+            _ => Err(anyhow!("expected float")),
+        },
+        "Boolean" => match value {
+            Value::Bool(b) => Ok(Value::Bool(*b)),
+            Value::String(s) if s == "true" => Ok(Value::Bool(true)),
+            Value::String(s) if s == "false" => Ok(Value::Bool(false)),
+            _ => Err(anyhow!("expected boolean")),
+        },
+        _ => Ok(value.clone()),
+    }
+}
+
 fn insert_nested(root: &mut Map<String, Value>, path: &str, value: Value) -> Result<()> {
     let segments: Vec<&str> = path.split('.').collect();
     if segments.is_empty() {
@@ -715,6 +830,26 @@ fn field_has_required_arg(field: &FieldDef) -> bool {
         .args
         .iter()
         .any(|a| matches!(a.type_ref.kind, TypeKind::NonNull) && a.default_value.is_none())
+}
+
+fn input_field_has_required_arg(type_ref: &TypeRef, schema: &GraphQLSchema) -> bool {
+    match type_ref.kind {
+        TypeKind::NonNull => {
+            let inner = type_ref.of_type.as_ref();
+            if let Some(inner) = inner {
+                if let Some(name) = inner.unwrap_name()
+                    && let Some(type_def) = schema.types.get(name)
+                    && matches!(type_def.kind, TypeKind::InputObject)
+                {
+                    return type_def.input_fields.iter().any(|f| {
+                        matches!(f.type_ref.kind, TypeKind::NonNull) && f.default_value.is_none()
+                    });
+                }
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Walks through LIST/NON_NULL wrappers to return the innermost TypeRef.
@@ -877,9 +1012,11 @@ fn build_operation(
 
     for arg_def in &field_def.args {
         if let Some(value) = args.get(&arg_def.name) {
+            let coerced = coerce_value_for_type(value, &arg_def.type_ref, schema)
+                .map_err(|e| anyhow!("invalid value for argument '{}': {}", arg_def.name, e))?;
             variable_decls.push(format!("${}: {}", arg_def.name, arg_def.type_ref.render()));
             call_args.push(format!("{}: ${}", arg_def.name, arg_def.name));
-            variables.insert(arg_def.name.clone(), value.clone());
+            variables.insert(arg_def.name.clone(), coerced);
         }
     }
 
@@ -934,6 +1071,166 @@ fn build_operation(
     );
 
     Ok(BuiltQuery { query, variables })
+}
+
+fn sample_scalar_literal(type_name: &str, field_name_hint: &str) -> String {
+    let hint = field_name_hint.to_ascii_lowercase();
+    match type_name {
+        "Boolean" => "true".to_string(),
+        "Int" => "1".to_string(),
+        "Float" => "1.5".to_string(),
+        "String" | "ID" => {
+            if hint.contains("code") {
+                if hint.contains("continent") {
+                    "EU".to_string()
+                } else if hint.contains("language") {
+                    "en".to_string()
+                } else if hint.contains("currency") {
+                    "USD".to_string()
+                } else {
+                    "US".to_string()
+                }
+            } else if hint.contains("search") || hint.contains("query") || hint.contains("term") {
+                "milk".to_string()
+            } else if hint.contains("name") {
+                "example".to_string()
+            } else if hint.contains("id") {
+                "abc123".to_string()
+            } else {
+                "value".to_string()
+            }
+        }
+        _ => "value".to_string(),
+    }
+}
+
+fn rank_input_field(name: &str) -> usize {
+    match name {
+        "eq" => 0,
+        "id" => 1,
+        "code" => 2,
+        "name" => 3,
+        "search" => 4,
+        "query" => 5,
+        _ => 100,
+    }
+}
+
+fn example_arg_token_for_type(
+    field_name: &str,
+    prefix: &str,
+    type_ref: &TypeRef,
+    schema: &GraphQLSchema,
+) -> Option<String> {
+    match type_ref.kind {
+        TypeKind::NonNull => type_ref
+            .of_type
+            .as_ref()
+            .and_then(|inner| example_arg_token_for_type(field_name, prefix, inner, schema)),
+        TypeKind::List => None,
+        _ => {
+            let type_name = type_ref.unwrap_name()?;
+            match schema.types.get(type_name) {
+                Some(type_def) if matches!(type_def.kind, TypeKind::InputObject) => {
+                    let field = type_def.input_fields.iter().min_by_key(|f| {
+                        let required = !(matches!(f.type_ref.kind, TypeKind::NonNull)
+                            && f.default_value.is_none());
+                        (required, rank_input_field(&f.name), &f.name)
+                    })?;
+                    let next_prefix = format!("{}.{}", prefix, field.name);
+                    example_arg_token_for_type(field_name, &next_prefix, &field.type_ref, schema)
+                }
+                Some(type_def) if matches!(type_def.kind, TypeKind::Enum) => type_def
+                    .enum_values
+                    .first()
+                    .map(|value| format!("{}:{}", prefix, value)),
+                _ => Some(format!(
+                    "{}:{}",
+                    prefix,
+                    sample_scalar_literal(type_name, &format!("{}.{}", field_name, prefix))
+                )),
+            }
+        }
+    }
+}
+
+fn smart_select_fields_cli_inner(
+    schema: &GraphQLSchema,
+    type_def: &TypeDef,
+    depth: usize,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    for field in &type_def.fields {
+        if field_has_required_arg(field) {
+            continue;
+        }
+
+        let inner = unwrap_type_ref(&field.type_ref);
+        let inner_name = inner.name.as_deref();
+        let inner_type = inner_name.and_then(|n| schema.types.get(n));
+        let (kind, nested_type) = match inner_type {
+            Some(t) => (t.kind.clone(), Some(t)),
+            None => (inner.kind.clone(), None),
+        };
+
+        if is_scalar_kind(&kind) {
+            parts.push(field.name.clone());
+        } else if matches!(kind, TypeKind::Object | TypeKind::Interface)
+            && depth < MAX_SELECTION_DEPTH
+            && let Some(t) = nested_type
+        {
+            let nested = smart_select_fields_cli_inner(schema, t, depth + 1);
+            if !nested.is_empty() {
+                parts.push(format!("{}{{{}}}", field.name, nested));
+            }
+        }
+    }
+
+    parts.join(",")
+}
+
+pub fn example_command_for_field(
+    command: &str,
+    field_name: &str,
+    field_def: &FieldDef,
+    schema: &GraphQLSchema,
+) -> String {
+    let mut arg_tokens: Vec<String> = field_def
+        .args
+        .iter()
+        .filter(|arg| matches!(arg.type_ref.kind, TypeKind::NonNull) && arg.default_value.is_none())
+        .filter_map(|arg| example_arg_token_for_type(field_name, &arg.name, &arg.type_ref, schema))
+        .collect();
+
+    if arg_tokens.is_empty()
+        && let Some(arg) = field_def
+            .args
+            .iter()
+            .find(|arg| !input_field_has_required_arg(&arg.type_ref, schema))
+            .or_else(|| field_def.args.first())
+        && let Some(token) =
+            example_arg_token_for_type(field_name, &arg.name, &arg.type_ref, schema)
+    {
+        arg_tokens.push(token);
+    }
+
+    let selection = field_def
+        .type_ref
+        .unwrap_name()
+        .and_then(|n| schema.types.get(n))
+        .filter(|t| matches!(t.kind, TypeKind::Object | TypeKind::Interface))
+        .map(|t| smart_select_fields_cli_inner(schema, t, 0))
+        .filter(|s| !s.is_empty());
+
+    let mut parts = vec![command.to_string()];
+    parts.extend(arg_tokens);
+    if let Some(fields) = selection {
+        parts.push("--fields".to_string());
+        parts.push(fields);
+    }
+
+    parts.join(" ")
 }
 
 /// Executes a BuiltQuery against the configured endpoint and returns the parsed response body.
@@ -1060,6 +1357,22 @@ mod tests {
     }
 
     #[test]
+    fn build_introspection_query_limits_of_type_depth() {
+        let shallow = build_introspection_query(2);
+        assert!(shallow.contains("ofType { kind name ofType { kind name"));
+        assert!(
+            !shallow.contains("ofType { kind name ofType { kind name ofType { kind name ofType")
+        );
+    }
+
+    #[test]
+    fn detects_query_depth_limit_errors() {
+        let body = r#"{"errors":[{"message":"Query depth limit exceeded.","extensions":{"code":"GCDN_QUERY_DEPTH_LIMIT","httpStatusCode":413}}]}"#;
+        assert!(is_query_depth_limit_error(413, body));
+        assert!(!is_query_depth_limit_error(400, body));
+    }
+
+    #[test]
     fn remembers_waf_fallback_by_url() {
         let url = "https://example.com/graphql";
         assert!(!should_use_waf_fallback(url));
@@ -1172,6 +1485,236 @@ mod tests {
                     },
                 ],
                 input_fields: vec![],
+                enum_values: vec![],
+            },
+        );
+
+        GraphQLSchema {
+            query_type: "Query".to_string(),
+            mutation_type: None,
+            types,
+        }
+    }
+
+    fn schema_with_countries_filter() -> GraphQLSchema {
+        let mut types = HashMap::new();
+
+        types.insert(
+            "Query".to_string(),
+            TypeDef {
+                name: "Query".to_string(),
+                kind: TypeKind::Object,
+                fields: vec![
+                    FieldDef {
+                        name: "countries".to_string(),
+                        description: None,
+                        args: vec![ArgDef {
+                            name: "filter".to_string(),
+                            type_ref: TypeRef {
+                                kind: TypeKind::InputObject,
+                                name: Some("CountryFilterInput".to_string()),
+                                of_type: None,
+                            },
+                            default_value: None,
+                        }],
+                        type_ref: TypeRef {
+                            kind: TypeKind::List,
+                            name: None,
+                            of_type: Some(Box::new(TypeRef {
+                                kind: TypeKind::Object,
+                                name: Some("Country".to_string()),
+                                of_type: None,
+                            })),
+                        },
+                    },
+                    FieldDef {
+                        name: "continents".to_string(),
+                        description: None,
+                        args: vec![ArgDef {
+                            name: "filter".to_string(),
+                            type_ref: TypeRef {
+                                kind: TypeKind::InputObject,
+                                name: Some("ContinentFilterInput".to_string()),
+                                of_type: None,
+                            },
+                            default_value: None,
+                        }],
+                        type_ref: TypeRef {
+                            kind: TypeKind::List,
+                            name: None,
+                            of_type: Some(Box::new(TypeRef {
+                                kind: TypeKind::Object,
+                                name: Some("Continent".to_string()),
+                                of_type: None,
+                            })),
+                        },
+                    },
+                ],
+                input_fields: vec![],
+                enum_values: vec![],
+            },
+        );
+
+        types.insert(
+            "Country".to_string(),
+            TypeDef {
+                name: "Country".to_string(),
+                kind: TypeKind::Object,
+                fields: vec![
+                    FieldDef {
+                        name: "code".to_string(),
+                        description: None,
+                        args: vec![],
+                        type_ref: TypeRef {
+                            kind: TypeKind::Scalar,
+                            name: Some("String".to_string()),
+                            of_type: None,
+                        },
+                    },
+                    FieldDef {
+                        name: "name".to_string(),
+                        description: None,
+                        args: vec![],
+                        type_ref: TypeRef {
+                            kind: TypeKind::Scalar,
+                            name: Some("String".to_string()),
+                            of_type: None,
+                        },
+                    },
+                    FieldDef {
+                        name: "capital".to_string(),
+                        description: None,
+                        args: vec![],
+                        type_ref: TypeRef {
+                            kind: TypeKind::Scalar,
+                            name: Some("String".to_string()),
+                            of_type: None,
+                        },
+                    },
+                ],
+                input_fields: vec![],
+                enum_values: vec![],
+            },
+        );
+
+        types.insert(
+            "CountryFilterInput".to_string(),
+            TypeDef {
+                name: "CountryFilterInput".to_string(),
+                kind: TypeKind::InputObject,
+                fields: vec![],
+                input_fields: vec![
+                    InputFieldDef {
+                        name: "code".to_string(),
+                        type_ref: TypeRef {
+                            kind: TypeKind::InputObject,
+                            name: Some("StringQueryOperatorInput".to_string()),
+                            of_type: None,
+                        },
+                        default_value: None,
+                    },
+                    InputFieldDef {
+                        name: "name".to_string(),
+                        type_ref: TypeRef {
+                            kind: TypeKind::InputObject,
+                            name: Some("StringQueryOperatorInput".to_string()),
+                            of_type: None,
+                        },
+                        default_value: None,
+                    },
+                ],
+                enum_values: vec![],
+            },
+        );
+
+        types.insert(
+            "Continent".to_string(),
+            TypeDef {
+                name: "Continent".to_string(),
+                kind: TypeKind::Object,
+                fields: vec![
+                    FieldDef {
+                        name: "code".to_string(),
+                        description: None,
+                        args: vec![],
+                        type_ref: TypeRef {
+                            kind: TypeKind::Scalar,
+                            name: Some("String".to_string()),
+                            of_type: None,
+                        },
+                    },
+                    FieldDef {
+                        name: "name".to_string(),
+                        description: None,
+                        args: vec![],
+                        type_ref: TypeRef {
+                            kind: TypeKind::Scalar,
+                            name: Some("String".to_string()),
+                            of_type: None,
+                        },
+                    },
+                ],
+                input_fields: vec![],
+                enum_values: vec![],
+            },
+        );
+
+        types.insert(
+            "ContinentFilterInput".to_string(),
+            TypeDef {
+                name: "ContinentFilterInput".to_string(),
+                kind: TypeKind::InputObject,
+                fields: vec![],
+                input_fields: vec![
+                    InputFieldDef {
+                        name: "code".to_string(),
+                        type_ref: TypeRef {
+                            kind: TypeKind::InputObject,
+                            name: Some("StringQueryOperatorInput".to_string()),
+                            of_type: None,
+                        },
+                        default_value: None,
+                    },
+                    InputFieldDef {
+                        name: "name".to_string(),
+                        type_ref: TypeRef {
+                            kind: TypeKind::InputObject,
+                            name: Some("StringQueryOperatorInput".to_string()),
+                            of_type: None,
+                        },
+                        default_value: None,
+                    },
+                ],
+                enum_values: vec![],
+            },
+        );
+
+        types.insert(
+            "StringQueryOperatorInput".to_string(),
+            TypeDef {
+                name: "StringQueryOperatorInput".to_string(),
+                kind: TypeKind::InputObject,
+                fields: vec![],
+                input_fields: vec![
+                    InputFieldDef {
+                        name: "eq".to_string(),
+                        type_ref: TypeRef {
+                            kind: TypeKind::Scalar,
+                            name: Some("String".to_string()),
+                            of_type: None,
+                        },
+                        default_value: None,
+                    },
+                    InputFieldDef {
+                        name: "regex".to_string(),
+                        type_ref: TypeRef {
+                            kind: TypeKind::Scalar,
+                            name: Some("String".to_string()),
+                            of_type: None,
+                        },
+                        default_value: None,
+                    },
+                ],
                 enum_values: vec![],
             },
         );
@@ -1331,6 +1874,67 @@ mod tests {
             built.variables.get("search").unwrap(),
             &Value::String("milk".to_string())
         );
+    }
+
+    #[test]
+    fn build_query_coerces_quoted_int_to_int() {
+        let mut schema = schema_with_products();
+        schema.types.get_mut("Query").unwrap().fields[0]
+            .args
+            .push(ArgDef {
+                name: "pageSize".to_string(),
+                type_ref: TypeRef {
+                    kind: TypeKind::Scalar,
+                    name: Some("Int".to_string()),
+                    of_type: None,
+                },
+                default_value: None,
+            });
+
+        let products_field = &schema.types.get("Query").unwrap().fields[0];
+        let mut args = Map::new();
+        args.insert("pageSize".to_string(), Value::String("3".to_string()));
+
+        let built = build_query("products", products_field, &args, None, &schema).unwrap();
+        assert_eq!(
+            built.variables.get("pageSize").unwrap(),
+            &serde_json::json!(3)
+        );
+    }
+
+    #[test]
+    fn build_query_rejects_unknown_nested_input_field() {
+        let schema = schema_with_countries_filter();
+        let countries_field = &schema.types.get("Query").unwrap().fields[0];
+        let mut args = Map::new();
+        args.insert(
+            "filter".to_string(),
+            serde_json::json!({"bogus": {"eq": "US"}}),
+        );
+
+        let err = build_query("countries", countries_field, &args, None, &schema).unwrap_err();
+        assert!(err.to_string().contains("CountryFilterInput"));
+    }
+
+    #[test]
+    fn example_command_uses_nested_input_shape() {
+        let schema = schema_with_countries_filter();
+        let countries_field = &schema.types.get("Query").unwrap().fields[0];
+
+        let example = example_command_for_field("query", "countries", countries_field, &schema);
+        assert_eq!(
+            example,
+            "query filter.code.eq:US --fields code,name,capital"
+        );
+    }
+
+    #[test]
+    fn example_command_uses_field_context_for_continent_codes() {
+        let schema = schema_with_countries_filter();
+        let continents_field = &schema.types.get("Query").unwrap().fields[1];
+
+        let example = example_command_for_field("query", "continents", continents_field, &schema);
+        assert_eq!(example, "query filter.code.eq:EU --fields code,name");
     }
 
     #[test]

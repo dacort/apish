@@ -325,7 +325,7 @@ impl ReplContext {
         if is_graphql {
             println!("{}", "GraphQL commands:".bold());
             println!(
-                "  {} - Run a query on the cd'd field (e.g., 'query search:milk pageSize:3')",
+                "  {} - Run a query on the cd'd field",
                 "query [args] [--fields ...]".yellow()
             );
             println!(
@@ -336,6 +336,40 @@ impl ReplContext {
                 "  {}        - Show all fields of a type",
                 "describe <Type>".yellow()
             );
+            println!();
+            println!("{}", "GraphQL notes:".bold());
+            println!(
+                "  Nested input args use dot notation, e.g. {}",
+                "filter.code.eq:US".cyan()
+            );
+            println!(
+                "  Bare strings are allowed when unambiguous, e.g. {}",
+                "search:milk".cyan()
+            );
+            println!(
+                "  Select response fields with {}, e.g. {}",
+                "--fields".yellow(),
+                "query filter.code.eq:US --fields code,name,capital".cyan()
+            );
+            println!(
+                "  Use {} to inspect input objects and operator types",
+                "describe <Type>".yellow()
+            );
+
+            if let Some(api_name) = &self.current_api
+                && let Some(schema) = self.graphql_schemas.get(api_name)
+                && let Some(crate::graphql::Navigation::Field {
+                    field, field_name, ..
+                }) = crate::graphql::resolve_path(schema, &self.current_path)
+            {
+                println!();
+                println!("{}", "Current field example:".bold());
+                println!(
+                    "  {}",
+                    crate::graphql::example_command_for_field("query", &field_name, field, schema)
+                        .cyan()
+                );
+            }
         } else {
             println!("{}", "REST commands:".bold());
             println!("  {}  - Make a GET request", "get <path>".yellow());
@@ -657,6 +691,14 @@ impl ReplContext {
 
         self.current_path = target_path;
         self.update_completion_state();
+        if let Some(crate::graphql::Navigation::Field {
+            field, field_name, ..
+        }) = crate::graphql::resolve_path(schema, &self.current_path)
+        {
+            let example =
+                crate::graphql::example_command_for_field("query", &field_name, field, schema);
+            println!("{} Example: {}", "ℹ".blue(), example.cyan());
+        }
         Ok(())
     }
 
