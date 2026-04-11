@@ -225,6 +225,12 @@ impl ReplContext {
     }
 
     fn show_help(&self) {
+        let is_graphql = self
+            .current_api
+            .as_ref()
+            .map(|n| self.is_graphql_api(n))
+            .unwrap_or(false);
+
         println!("{}", "Available commands:".bold());
         println!();
         println!("  {}  - Display this help message", "help".yellow());
@@ -239,24 +245,43 @@ impl ReplContext {
         );
         println!("  {}   - Show current path", "pwd".yellow());
         println!(
-            "  {}    - List available endpoints for current API",
+            "  {}    - List endpoints / schema fields for current API",
             "ls".yellow()
         );
         println!();
-        println!("  {}  - Make a GET request", "get <path>".yellow());
-        println!(
-            "  {} - Make a POST request with JSON body",
-            "post <path> <json>".yellow()
-        );
-        println!(
-            "  {}  - Make a PUT request with JSON body",
-            "put <path> <json>".yellow()
-        );
-        println!(
-            "  {} - Make a PATCH request with JSON body",
-            "patch <path> <json>".yellow()
-        );
-        println!("  {} - Make a DELETE request", "delete <path>".yellow());
+
+        if is_graphql {
+            println!("{}", "GraphQL commands:".bold());
+            println!(
+                "  {} - Run a query on the cd'd field (e.g., 'query search:milk pageSize:3')",
+                "query [args] [--fields ...]".yellow()
+            );
+            println!(
+                "  {} - Run a mutation by name",
+                "mutate <name> [args] [--fields ...]".yellow()
+            );
+            println!(
+                "  {}        - Show all fields of a type",
+                "describe <Type>".yellow()
+            );
+        } else {
+            println!("{}", "REST commands:".bold());
+            println!("  {}  - Make a GET request", "get <path>".yellow());
+            println!(
+                "  {} - Make a POST request with JSON body",
+                "post <path> <json>".yellow()
+            );
+            println!(
+                "  {}  - Make a PUT request with JSON body",
+                "put <path> <json>".yellow()
+            );
+            println!(
+                "  {} - Make a PATCH request with JSON body",
+                "patch <path> <json>".yellow()
+            );
+            println!("  {} - Make a DELETE request", "delete <path>".yellow());
+        }
+
         println!();
         println!("  {} - Show request history", "history".yellow());
         println!("  {} - Show current API configuration", "config".yellow());
