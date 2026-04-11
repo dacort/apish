@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 
 const COMMANDS: &[&str] = &[
     "help", "exit", "quit", "apis", "use", "cd", "pwd", "ls", "get", "post", "put", "delete",
-    "patch", "GET", "POST", "PUT", "DELETE", "PATCH", "history", "config", ":w",
+    "patch", "GET", "POST", "PUT", "DELETE", "PATCH", "history", "config", ":w", "query", "mutate",
+    "describe",
 ];
 
 const HTTP_COMMANDS: &[&str] = &[
@@ -210,6 +211,7 @@ impl ReplContext {
             "history" => self.show_history(),
             "config" => self.show_config()?,
             ":w" => self.save_config(&parts[1..])?,
+            "describe" => self.describe_type(&parts[1..])?,
             _ => println!(
                 "{} Unknown command: {}. Type 'help' for available commands.",
                 "✗".red(),
@@ -371,7 +373,11 @@ impl ReplContext {
 
         let (url, headers, auth) = {
             let config = self.apis.get(api_name).unwrap();
-            (config.base_url.clone(), config.headers.clone(), config.auth.clone())
+            (
+                config.base_url.clone(),
+                config.headers.clone(),
+                config.auth.clone(),
+            )
         };
 
         println!("{} Loading GraphQL schema from {}...", "ℹ".blue(), url);
@@ -663,11 +669,7 @@ impl ReplContext {
                 if !field.args.is_empty() {
                     println!("{}", "Arguments:".bold());
                     for arg in &field.args {
-                        println!(
-                            "  {}: {}",
-                            arg.name.cyan(),
-                            arg.type_ref.render().yellow()
-                        );
+                        println!("  {}: {}", arg.name.cyan(), arg.type_ref.render().yellow());
                     }
                     println!();
                 }
@@ -682,24 +684,69 @@ impl ReplContext {
                         format!("{:?}", return_type.kind).dimmed()
                     );
                     for f in &return_type.fields {
-                        println!(
-                            "  {} → {}",
-                            f.name.green(),
-                            f.type_ref.render().yellow()
-                        );
+                        println!("  {} → {}", f.name.green(), f.type_ref.render().yellow());
                     }
                     println!();
                 }
             }
             None => {
-                println!(
-                    "{} Invalid path: {}",
-                    "✗".red(),
-                    self.current_path
-                );
+                println!("{} Invalid path: {}", "✗".red(), self.current_path);
             }
         }
 
+        Ok(())
+    }
+
+    fn describe_type(&self, args: &[&str]) -> Result<()> {
+        let api_name = self
+            .current_api
+            .as_ref()
+            .ok_or_else(|| anyhow!("No API selected"))?;
+
+        if !self.is_graphql_api(api_name) {
+            return Err(anyhow!("describe is only available for GraphQL APIs"));
+        }
+
+        if args.is_empty() {
+            return Err(anyhow!("Usage: describe <TypeName>"));
+        }
+
+        let schema = self
+            .graphql_schemas
+            .get(api_name)
+            .ok_or_else(|| anyhow!("GraphQL schema not loaded"))?;
+
+        let type_name = args[0];
+        let type_def = schema
+            .types
+            .get(type_name)
+            .ok_or_else(|| anyhow!("Type not found in schema: {}", type_name))?;
+
+        println!(
+            "{} ({})",
+            type_def.name.bold(),
+            format!("{:?}", type_def.kind).dimmed()
+        );
+
+        if !type_def.fields.is_empty() {
+            for f in &type_def.fields {
+                println!("  {} → {}", f.name.green(), f.type_ref.render().yellow());
+            }
+        }
+
+        if !type_def.input_fields.is_empty() {
+            for f in &type_def.input_fields {
+                println!("  {} → {}", f.name.green(), f.type_ref.render().yellow());
+            }
+        }
+
+        if !type_def.enum_values.is_empty() {
+            for v in &type_def.enum_values {
+                println!("  {}", v.green());
+            }
+        }
+
+        println!();
         Ok(())
     }
 

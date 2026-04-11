@@ -75,11 +75,19 @@ impl TypeRef {
     pub fn render(&self) -> String {
         match self.kind {
             TypeKind::NonNull => {
-                let inner = self.of_type.as_ref().map(|t| t.render()).unwrap_or_default();
+                let inner = self
+                    .of_type
+                    .as_ref()
+                    .map(|t| t.render())
+                    .unwrap_or_default();
                 format!("{}!", inner)
             }
             TypeKind::List => {
-                let inner = self.of_type.as_ref().map(|t| t.render()).unwrap_or_default();
+                let inner = self
+                    .of_type
+                    .as_ref()
+                    .map(|t| t.render())
+                    .unwrap_or_default();
                 format!("[{}]", inner)
             }
             _ => self.name.clone().unwrap_or_else(|| "?".to_string()),
@@ -228,7 +236,11 @@ pub fn parse_introspection(body: &str) -> Result<GraphQLSchema> {
         let input_fields = t
             .input_fields
             .as_ref()
-            .map(|fs| fs.iter().map(convert_input_field).collect::<Result<Vec<_>>>())
+            .map(|fs| {
+                fs.iter()
+                    .map(convert_input_field)
+                    .collect::<Result<Vec<_>>>()
+            })
             .transpose()?
             .unwrap_or_default();
         let enum_values = t
@@ -322,9 +334,7 @@ pub fn fetch_schema(
     headers: &HashMap<String, String>,
     auth: Option<&AuthConfig>,
 ) -> Result<GraphQLSchema> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
 
     let mut req = client
         .post(url)
@@ -341,7 +351,11 @@ pub fn fetch_schema(
     if let Some(auth) = auth {
         req = match auth {
             AuthConfig::Bearer { token } => req.bearer_auth(token),
-            AuthConfig::ApiKey { name, value, location } => match location {
+            AuthConfig::ApiKey {
+                name,
+                value,
+                location,
+            } => match location {
                 KeyLocation::Header => req.header(name, value),
                 KeyLocation::Query => req.query(&[(name, value)]),
             },
@@ -664,7 +678,11 @@ mod tests {
         let schema = schema_with_products();
         let nav = resolve_path(&schema, "/products").unwrap();
         match nav {
-            Navigation::Field { type_name, field_name, .. } => {
+            Navigation::Field {
+                type_name,
+                field_name,
+                ..
+            } => {
                 assert_eq!(type_name, "Query");
                 assert_eq!(field_name, "products");
             }
@@ -677,7 +695,11 @@ mod tests {
         let schema = schema_with_products();
         let nav = resolve_path(&schema, "/products/items").unwrap();
         match nav {
-            Navigation::Field { type_name, field_name, .. } => {
+            Navigation::Field {
+                type_name,
+                field_name,
+                ..
+            } => {
                 assert_eq!(type_name, "Products");
                 assert_eq!(field_name, "items");
             }
