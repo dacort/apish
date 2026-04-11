@@ -604,6 +604,63 @@ pub fn smart_select_fields(schema: &GraphQLSchema, type_def: &TypeDef, depth: us
     format!("{{ {} }}", parts.join(" "))
 }
 
+/// Parses the shorthand `--fields` syntax into a GraphQL selection set string.
+///
+/// Input:  `items{sku,item_title},total_count`
+/// Output: `{ items { sku item_title } total_count }`
+///
+/// Whitespace inside the input is ignored. Curly braces nest, commas separate.
+pub fn parse_field_selection(input: &str) -> Result<String> {
+    let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut chars = cleaned.chars().peekable();
+    let body = parse_selection_body(&mut chars)?;
+    Ok(format!("{{ {} }}", body))
+}
+
+fn parse_selection_body<I>(chars: &mut std::iter::Peekable<I>) -> Result<String>
+where
+    I: Iterator<Item = char>,
+{
+    let mut parts: Vec<String> = Vec::new();
+    let mut current_name = String::new();
+
+    while let Some(&c) = chars.peek() {
+        match c {
+            '{' => {
+                chars.next();
+                let inner = parse_selection_body(chars)?;
+                let name = std::mem::take(&mut current_name);
+                if name.is_empty() {
+                    return Err(anyhow!("'{{' without a preceding field name"));
+                }
+                parts.push(format!("{} {{ {} }}", name, inner));
+            }
+            '}' => {
+                chars.next();
+                if !current_name.is_empty() {
+                    parts.push(std::mem::take(&mut current_name));
+                }
+                return Ok(parts.join(" "));
+            }
+            ',' => {
+                chars.next();
+                if !current_name.is_empty() {
+                    parts.push(std::mem::take(&mut current_name));
+                }
+            }
+            _ => {
+                current_name.push(c);
+                chars.next();
+            }
+        }
+    }
+
+    if !current_name.is_empty() {
+        parts.push(current_name);
+    }
+    Ok(parts.join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,6 +979,24 @@ mod tests {
         assert!(selection.contains("items"));
         assert!(selection.contains("sku"));
         assert!(selection.contains("item_title"));
+    }
+
+    #[test]
+    fn parse_simple_field_list() {
+        let s = parse_field_selection("sku,item_title").unwrap();
+        assert_eq!(s, "{ sku item_title }");
+    }
+
+    #[test]
+    fn parse_nested_field_list() {
+        let s = parse_field_selection("items{sku,item_title},total_count").unwrap();
+        assert_eq!(s, "{ items { sku item_title } total_count }");
+    }
+
+    #[test]
+    fn parse_deeply_nested() {
+        let s = parse_field_selection("a{b{c,d}}").unwrap();
+        assert_eq!(s, "{ a { b { c d } } }");
     }
 
     #[test]
