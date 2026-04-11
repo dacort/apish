@@ -185,7 +185,15 @@ impl ReplContext {
             "use" => self.use_api(&parts[1..])?,
             "cd" => self.change_path(&parts[1..])?,
             "pwd" => println!("{}", self.current_path),
-            "ls" => self.list_endpoints()?,
+            "ls" => {
+                if let Some(api) = &self.current_api.clone()
+                    && self.is_graphql_api(api)
+                {
+                    self.list_graphql()?;
+                } else {
+                    self.list_endpoints()?;
+                }
+            }
             "get" | "GET" => self.http_request("GET", &parts[1..])?,
             "post" | "POST" => self.http_request("POST", &parts[1..])?,
             "put" | "PUT" => self.http_request("PUT", &parts[1..])?,
@@ -525,6 +533,112 @@ impl ReplContext {
         }
 
         println!();
+        Ok(())
+    }
+
+    fn list_graphql(&self) -> Result<()> {
+        let api_name = self
+            .current_api
+            .as_ref()
+            .ok_or_else(|| anyhow!("No API selected. Use 'use <api>' first."))?;
+
+        let schema = self
+            .graphql_schemas
+            .get(api_name)
+            .ok_or_else(|| anyhow!("GraphQL schema not loaded for {}", api_name))?;
+
+        match crate::graphql::resolve_path(schema, &self.current_path) {
+            Some(crate::graphql::Navigation::Root) => {
+                // List queries and mutations
+                if let Some(query_type) = schema.types.get(&schema.query_type) {
+                    println!("{}", "Queries:".bold());
+                    let display_limit = 15;
+                    for (i, field) in query_type.fields.iter().enumerate() {
+                        if i >= display_limit {
+                            println!(
+                                "  {} ({} more — use `ls -a` for all)",
+                                "...".dimmed(),
+                                query_type.fields.len() - display_limit
+                            );
+                            break;
+                        }
+                        let args: Vec<String> = field.args.iter().map(|a| a.name.clone()).collect();
+                        let arg_str = if args.is_empty() {
+                            String::new()
+                        } else {
+                            format!("({})", args.join(", "))
+                        };
+                        println!(
+                            "  {}{} → {}",
+                            field.name.green(),
+                            arg_str.dimmed(),
+                            field.type_ref.render().yellow()
+                        );
+                    }
+                    println!();
+                }
+
+                if let Some(mut_name) = &schema.mutation_type
+                    && let Some(mut_type) = schema.types.get(mut_name)
+                {
+                    println!("{}", "Mutations:".bold());
+                    let display_limit = 15;
+                    for (i, field) in mut_type.fields.iter().enumerate() {
+                        if i >= display_limit {
+                            println!(
+                                "  {} ({} more — use `ls -a` for all)",
+                                "...".dimmed(),
+                                mut_type.fields.len() - display_limit
+                            );
+                            break;
+                        }
+                        println!("  {}", field.name.green());
+                    }
+                    println!();
+                }
+            }
+            Some(crate::graphql::Navigation::Field { field, .. }) => {
+                // Show args + return type fields
+                if !field.args.is_empty() {
+                    println!("{}", "Arguments:".bold());
+                    for arg in &field.args {
+                        println!(
+                            "  {}: {}",
+                            arg.name.cyan(),
+                            arg.type_ref.render().yellow()
+                        );
+                    }
+                    println!();
+                }
+
+                let return_type_name = field.type_ref.unwrap_name();
+                if let Some(name) = return_type_name
+                    && let Some(return_type) = schema.types.get(name)
+                {
+                    println!(
+                        "{} ({})",
+                        format!("Returns {}:", name).bold(),
+                        format!("{:?}", return_type.kind).dimmed()
+                    );
+                    for f in &return_type.fields {
+                        println!(
+                            "  {} → {}",
+                            f.name.green(),
+                            f.type_ref.render().yellow()
+                        );
+                    }
+                    println!();
+                }
+            }
+            None => {
+                println!(
+                    "{} Invalid path: {}",
+                    "✗".red(),
+                    self.current_path
+                );
+            }
+        }
+
         Ok(())
     }
 
