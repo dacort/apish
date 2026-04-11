@@ -213,6 +213,7 @@ impl ReplContext {
             ":w" => self.save_config(&parts[1..])?,
             "describe" => self.describe_type(&parts[1..])?,
             "query" => self.do_query(&parts[1..])?,
+            "mutate" => self.do_mutate(&parts[1..])?,
             _ => println!(
                 "{} Unknown command: {}. Type 'help' for available commands.",
                 "✗".red(),
@@ -961,6 +962,81 @@ impl ReplContext {
         Ok(())
     }
 
+    fn do_mutate(&mut self, args: &[&str]) -> Result<()> {
+        let api_name = self
+            .current_api
+            .as_ref()
+            .ok_or_else(|| anyhow!("No API selected"))?
+            .clone();
+
+        if !self.is_graphql_api(&api_name) {
+            return Err(anyhow!(
+                "{} is a REST API — use 'post'/'put'/etc instead",
+                api_name
+            ));
+        }
+
+        if args.is_empty() {
+            return Err(anyhow!("Usage: mutate <name> [args...] [--fields ...]"));
+        }
+
+        let mutation_name = args[0].to_string();
+        let rest = &args[1..];
+
+        let (parsed_args, selection) = split_query_args(rest)?;
+
+        // Scope the schema borrow so it ends before we mutably borrow self.history
+        let built = {
+            let schema = self
+                .graphql_schemas
+                .get(&api_name)
+                .ok_or_else(|| anyhow!("GraphQL schema not loaded"))?;
+
+            let mut_type_name = schema
+                .mutation_type
+                .as_ref()
+                .ok_or_else(|| anyhow!("schema has no Mutation type"))?;
+            let mut_type = schema
+                .types
+                .get(mut_type_name)
+                .ok_or_else(|| anyhow!("Mutation type not found in schema"))?;
+
+            let field = mut_type
+                .fields
+                .iter()
+                .find(|f| f.name == mutation_name)
+                .ok_or_else(|| anyhow!("mutation not found: {}", mutation_name))?;
+
+            crate::graphql::build_mutation(
+                &mutation_name,
+                field,
+                &parsed_args,
+                selection.as_deref(),
+                schema,
+            )?
+        };
+
+        let (url, headers, auth) = {
+            let config = self.apis.get(&api_name).unwrap();
+            (
+                config.base_url.clone(),
+                config.headers.clone(),
+                config.auth.clone(),
+            )
+        };
+
+        println!("{} {}", "→".blue(), built.query.dimmed());
+
+        let (status, body) = crate::graphql::execute_query(&url, &headers, auth.as_ref(), &built)?;
+
+        print_graphql_response(status, &body);
+
+        self.history
+            .add_entry(api_name, "MUTATE".to_string(), mutation_name, Some(status));
+        let _ = self.save_history();
+
+        Ok(())
+    }
 }
 
 fn split_query_args(
