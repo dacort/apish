@@ -1,6 +1,9 @@
+use crate::config::{AuthConfig, KeyLocation};
 use anyhow::{Result, anyhow};
+use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct GraphQLSchema {
@@ -253,11 +256,6 @@ pub fn parse_introspection(body: &str) -> Result<GraphQLSchema> {
     })
 }
 
-use crate::config::{AuthConfig, KeyLocation};
-use reqwest::blocking::Client;
-use std::collections::HashMap as StdHashMap;
-use std::time::Duration;
-
 pub const INTROSPECTION_QUERY: &str = r#"{
   __schema {
     queryType { name }
@@ -321,7 +319,7 @@ fragment TypeRef on __Type {
 /// Fetches the schema from a GraphQL endpoint by POSTing the introspection query.
 pub fn fetch_schema(
     url: &str,
-    headers: &StdHashMap<String, String>,
+    headers: &HashMap<String, String>,
     auth: Option<&AuthConfig>,
 ) -> Result<GraphQLSchema> {
     let client = Client::builder()
