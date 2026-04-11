@@ -361,6 +361,59 @@ pub fn fetch_schema(
     parse_introspection(&body)
 }
 
+/// Where the user currently "is" within a GraphQL schema.
+#[derive(Debug, Clone)]
+pub enum Navigation<'a> {
+    Root,
+    Field {
+        /// The name of the type containing this field (e.g. "Query", "Products").
+        type_name: String,
+        /// The field name (e.g. "products", "items").
+        field_name: String,
+        /// The field definition itself, for arg lookup.
+        field: &'a FieldDef,
+    },
+}
+
+/// Resolves a slash-separated path against the schema, starting at Query.
+/// Returns None if any path segment doesn't exist as a field on the current type.
+pub fn resolve_path<'a>(schema: &'a GraphQLSchema, path: &str) -> Option<Navigation<'a>> {
+    let segments: Vec<&str> = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if segments.is_empty() {
+        return Some(Navigation::Root);
+    }
+
+    let mut current_type_name = schema.query_type.clone();
+    let mut last_field: Option<&FieldDef> = None;
+
+    for (i, segment) in segments.iter().enumerate() {
+        let type_def = schema.types.get(&current_type_name)?;
+        let field = type_def.fields.iter().find(|f| f.name == *segment)?;
+
+        if i == segments.len() - 1 {
+            return Some(Navigation::Field {
+                type_name: current_type_name.clone(),
+                field_name: segment.to_string(),
+                field,
+            });
+        }
+
+        // Descend into the field's return type.
+        let next_type_name = field.type_ref.unwrap_name()?.to_string();
+        current_type_name = next_type_name;
+        last_field = Some(field);
+    }
+
+    // Unreachable: loop always returns on the last segment.
+    let _ = last_field;
+    None
+}
+
 /// Quick check: does this URL respond to a GraphQL introspection query with a valid schema?
 pub fn detect_graphql(url: &str) -> bool {
     let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
@@ -484,5 +537,157 @@ mod tests {
         assert_eq!(query_type.fields.len(), 1);
         assert_eq!(query_type.fields[0].name, "hello");
         assert_eq!(query_type.fields[0].type_ref.render(), "String");
+    }
+
+    fn schema_with_products() -> GraphQLSchema {
+        // Build a small fake schema:
+        // Query.products(search: String): Products
+        // Products { items: [Product], total_count: Int }
+        // Product { sku: String, item_title: String }
+        let mut types = HashMap::new();
+
+        types.insert(
+            "Query".to_string(),
+            TypeDef {
+                name: "Query".to_string(),
+                kind: TypeKind::Object,
+                fields: vec![FieldDef {
+                    name: "products".to_string(),
+                    description: None,
+                    args: vec![ArgDef {
+                        name: "search".to_string(),
+                        type_ref: TypeRef {
+                            kind: TypeKind::Scalar,
+                            name: Some("String".to_string()),
+                            of_type: None,
+                        },
+                        default_value: None,
+                    }],
+                    type_ref: TypeRef {
+                        kind: TypeKind::Object,
+                        name: Some("Products".to_string()),
+                        of_type: None,
+                    },
+                }],
+                input_fields: vec![],
+                enum_values: vec![],
+            },
+        );
+
+        types.insert(
+            "Products".to_string(),
+            TypeDef {
+                name: "Products".to_string(),
+                kind: TypeKind::Object,
+                fields: vec![
+                    FieldDef {
+                        name: "items".to_string(),
+                        description: None,
+                        args: vec![],
+                        type_ref: TypeRef {
+                            kind: TypeKind::List,
+                            name: None,
+                            of_type: Some(Box::new(TypeRef {
+                                kind: TypeKind::Object,
+                                name: Some("Product".to_string()),
+                                of_type: None,
+                            })),
+                        },
+                    },
+                    FieldDef {
+                        name: "total_count".to_string(),
+                        description: None,
+                        args: vec![],
+                        type_ref: TypeRef {
+                            kind: TypeKind::Scalar,
+                            name: Some("Int".to_string()),
+                            of_type: None,
+                        },
+                    },
+                ],
+                input_fields: vec![],
+                enum_values: vec![],
+            },
+        );
+
+        types.insert(
+            "Product".to_string(),
+            TypeDef {
+                name: "Product".to_string(),
+                kind: TypeKind::Object,
+                fields: vec![
+                    FieldDef {
+                        name: "sku".to_string(),
+                        description: None,
+                        args: vec![],
+                        type_ref: TypeRef {
+                            kind: TypeKind::Scalar,
+                            name: Some("String".to_string()),
+                            of_type: None,
+                        },
+                    },
+                    FieldDef {
+                        name: "item_title".to_string(),
+                        description: None,
+                        args: vec![],
+                        type_ref: TypeRef {
+                            kind: TypeKind::Scalar,
+                            name: Some("String".to_string()),
+                            of_type: None,
+                        },
+                    },
+                ],
+                input_fields: vec![],
+                enum_values: vec![],
+            },
+        );
+
+        GraphQLSchema {
+            query_type: "Query".to_string(),
+            mutation_type: None,
+            types,
+        }
+    }
+
+    #[test]
+    fn resolve_root() {
+        let schema = schema_with_products();
+        let nav = resolve_path(&schema, "/").unwrap();
+        match nav {
+            Navigation::Root => {}
+            _ => panic!("expected Root"),
+        }
+    }
+
+    #[test]
+    fn resolve_query_field() {
+        let schema = schema_with_products();
+        let nav = resolve_path(&schema, "/products").unwrap();
+        match nav {
+            Navigation::Field { type_name, field_name, .. } => {
+                assert_eq!(type_name, "Query");
+                assert_eq!(field_name, "products");
+            }
+            _ => panic!("expected Field"),
+        }
+    }
+
+    #[test]
+    fn resolve_nested_field() {
+        let schema = schema_with_products();
+        let nav = resolve_path(&schema, "/products/items").unwrap();
+        match nav {
+            Navigation::Field { type_name, field_name, .. } => {
+                assert_eq!(type_name, "Products");
+                assert_eq!(field_name, "items");
+            }
+            _ => panic!("expected Field"),
+        }
+    }
+
+    #[test]
+    fn resolve_invalid_path_returns_none() {
+        let schema = schema_with_products();
+        assert!(resolve_path(&schema, "/nonexistent").is_none());
     }
 }
