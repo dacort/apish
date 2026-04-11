@@ -1,5 +1,6 @@
 use crate::api::ApiClient;
 use crate::config::{ApiConfig, History};
+use crate::graphql::GraphQLSchema;
 use crate::openapi::{self, EndpointInfo};
 use anyhow::{Result, anyhow};
 use colored::Colorize;
@@ -121,6 +122,7 @@ pub struct ReplContext {
     current_path: String,
     history: History,
     openapi_endpoints: HashMap<String, Vec<EndpointInfo>>,
+    graphql_schemas: HashMap<String, GraphQLSchema>,
     completion_state: Arc<Mutex<CompletionState>>,
 }
 
@@ -152,6 +154,7 @@ impl ReplContext {
             current_path: "/".to_string(),
             history,
             openapi_endpoints: HashMap::new(),
+            graphql_schemas: HashMap::new(),
             completion_state,
         })
     }
