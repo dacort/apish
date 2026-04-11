@@ -2,6 +2,7 @@ use crate::config::{AuthConfig, KeyLocation};
 use anyhow::{Result, anyhow};
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -455,6 +456,88 @@ pub fn detect_graphql(url: &str) -> bool {
     text.contains("\"__schema\"") && text.contains("\"queryType\"")
 }
 
+/// Parses CLI-style key:value args (with dot notation for nesting) into a JSON object.
+///
+/// Examples:
+///   `search:milk`                  → `{"search": "milk"}`
+///   `pageSize:3`                   → `{"pageSize": 3}`
+///   `filter.store_code.eq:"TJ"`    → `{"filter": {"store_code": {"eq": "TJ"}}}`
+///
+/// Type inference (when value is unquoted):
+///   - bare integer → JSON number
+///   - bare float   → JSON number
+///   - `true`/`false` → JSON bool
+///   - `null` → JSON null
+///   - everything else → JSON string
+pub fn parse_args(tokens: &[&str]) -> Result<Map<String, Value>> {
+    let mut root = Map::new();
+    for token in tokens {
+        let (path, raw_value) = token
+            .split_once(':')
+            .ok_or_else(|| anyhow!("argument missing ':' separator: {}", token))?;
+        let value = parse_scalar_value(raw_value);
+        insert_nested(&mut root, path, value)?;
+    }
+    Ok(root)
+}
+
+fn parse_scalar_value(raw: &str) -> Value {
+    // Quoted string
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        return Value::String(raw[1..raw.len() - 1].to_string());
+    }
+    // Bool
+    if raw == "true" {
+        return Value::Bool(true);
+    }
+    if raw == "false" {
+        return Value::Bool(false);
+    }
+    // Null
+    if raw == "null" {
+        return Value::Null;
+    }
+    // Int / Float
+    if let Ok(n) = raw.parse::<i64>() {
+        return Value::Number(n.into());
+    }
+    if let Ok(f) = raw.parse::<f64>()
+        && let Some(n) = serde_json::Number::from_f64(f)
+    {
+        return Value::Number(n);
+    }
+    // Fall through: bare string
+    Value::String(raw.to_string())
+}
+
+fn insert_nested(root: &mut Map<String, Value>, path: &str, value: Value) -> Result<()> {
+    let segments: Vec<&str> = path.split('.').collect();
+    if segments.is_empty() {
+        return Err(anyhow!("empty argument path"));
+    }
+
+    let mut current = root;
+    for (i, segment) in segments.iter().enumerate() {
+        if i == segments.len() - 1 {
+            current.insert(segment.to_string(), value);
+            return Ok(());
+        }
+        let entry = current
+            .entry(segment.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        match entry {
+            Value::Object(obj) => current = obj,
+            _ => {
+                return Err(anyhow!(
+                    "conflicting types at argument path segment '{}'",
+                    segment
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,5 +794,53 @@ mod tests {
     fn resolve_invalid_path_returns_none() {
         let schema = schema_with_products();
         assert!(resolve_path(&schema, "/nonexistent").is_none());
+    }
+
+    #[test]
+    fn parse_simple_string_arg() {
+        let args = parse_args(&["search:milk"]).unwrap();
+        assert_eq!(args.get("search").unwrap(), &serde_json::json!("milk"));
+    }
+
+    #[test]
+    fn parse_quoted_string_arg() {
+        let args = parse_args(&["search:\"hello world\""]).unwrap();
+        assert_eq!(
+            args.get("search").unwrap(),
+            &serde_json::json!("hello world")
+        );
+    }
+
+    #[test]
+    fn parse_int_arg() {
+        let args = parse_args(&["pageSize:3"]).unwrap();
+        assert_eq!(args.get("pageSize").unwrap(), &serde_json::json!(3));
+    }
+
+    #[test]
+    fn parse_bool_arg() {
+        let args = parse_args(&["enabled:true"]).unwrap();
+        assert_eq!(args.get("enabled").unwrap(), &serde_json::json!(true));
+    }
+
+    #[test]
+    fn parse_nested_arg() {
+        let args = parse_args(&["filter.store_code.eq:TJ"]).unwrap();
+        assert_eq!(
+            args.get("filter").unwrap(),
+            &serde_json::json!({"store_code": {"eq": "TJ"}})
+        );
+    }
+
+    #[test]
+    fn parse_multiple_nested_into_same_object() {
+        let args = parse_args(&["filter.store_code.eq:TJ", "filter.published.eq:1"]).unwrap();
+        assert_eq!(
+            args.get("filter").unwrap(),
+            &serde_json::json!({
+                "store_code": {"eq": "TJ"},
+                "published": {"eq": 1}
+            })
+        );
     }
 }
