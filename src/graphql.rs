@@ -538,6 +538,72 @@ fn insert_nested(root: &mut Map<String, Value>, path: &str, value: Value) -> Res
     Ok(())
 }
 
+const MAX_SELECTION_DEPTH: usize = 2;
+
+fn is_scalar_kind(k: &TypeKind) -> bool {
+    matches!(k, TypeKind::Scalar | TypeKind::Enum)
+}
+
+fn field_has_required_arg(field: &FieldDef) -> bool {
+    field
+        .args
+        .iter()
+        .any(|a| matches!(a.type_ref.kind, TypeKind::NonNull) && a.default_value.is_none())
+}
+
+/// Walks through LIST/NON_NULL wrappers to return the innermost TypeRef.
+fn unwrap_type_ref(t: &TypeRef) -> &TypeRef {
+    match (&t.kind, &t.of_type) {
+        (TypeKind::List | TypeKind::NonNull, Some(inner)) => unwrap_type_ref(inner),
+        _ => t,
+    }
+}
+
+/// Builds a GraphQL selection set string for the given type, automatically
+/// picking all scalar fields plus one level of nested object scalars (up to MAX_SELECTION_DEPTH).
+/// Returns a string like "{ items { sku item_title } total_count }".
+pub fn smart_select_fields(schema: &GraphQLSchema, type_def: &TypeDef, depth: usize) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    for field in &type_def.fields {
+        if field_has_required_arg(field) {
+            continue;
+        }
+
+        // Resolve the innermost type ref (unwrapping LIST/NON_NULL).
+        let inner = unwrap_type_ref(&field.type_ref);
+        let inner_name = inner.name.as_deref();
+        let inner_type = inner_name.and_then(|n| schema.types.get(n));
+
+        // Prefer the schema's type definition when available so we know the actual kind;
+        // otherwise fall back to the type_ref's own kind (which is populated for scalars
+        // and enums in most introspection responses).
+        let (kind, nested_type) = match inner_type {
+            Some(t) => (t.kind.clone(), Some(t)),
+            None => (inner.kind.clone(), None),
+        };
+
+        if is_scalar_kind(&kind) {
+            parts.push(field.name.clone());
+        } else if matches!(kind, TypeKind::Object | TypeKind::Interface)
+            && depth < MAX_SELECTION_DEPTH
+        {
+            if let Some(t) = nested_type {
+                let nested = smart_select_fields(schema, t, depth + 1);
+                if !nested.is_empty() && nested != "{ }" {
+                    parts.push(format!("{} {}", field.name, nested));
+                }
+            }
+        }
+        // Otherwise: skip union, input_object, too-deep nesting, or unknown types.
+    }
+
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("{{ {} }}", parts.join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,5 +908,55 @@ mod tests {
                 "published": {"eq": 1}
             })
         );
+    }
+
+    #[test]
+    fn smart_select_scalars_only() {
+        let schema = schema_with_products();
+        // From inside `products`, the return type is Products.
+        // Smart select should pick: items{sku item_title} total_count
+        let products_type = schema.types.get("Products").unwrap();
+        let selection = smart_select_fields(&schema, products_type, 0);
+        // Expect both items and total_count
+        assert!(selection.contains("total_count"));
+        assert!(selection.contains("items"));
+        assert!(selection.contains("sku"));
+        assert!(selection.contains("item_title"));
+    }
+
+    #[test]
+    fn smart_select_skips_args_required_fields() {
+        // If a field has required args, skip it.
+        let mut schema = schema_with_products();
+        schema
+            .types
+            .get_mut("Products")
+            .unwrap()
+            .fields
+            .push(FieldDef {
+                name: "needs_arg".to_string(),
+                description: None,
+                args: vec![ArgDef {
+                    name: "id".to_string(),
+                    type_ref: TypeRef {
+                        kind: TypeKind::NonNull,
+                        name: None,
+                        of_type: Some(Box::new(TypeRef {
+                            kind: TypeKind::Scalar,
+                            name: Some("ID".to_string()),
+                            of_type: None,
+                        })),
+                    },
+                    default_value: None,
+                }],
+                type_ref: TypeRef {
+                    kind: TypeKind::Scalar,
+                    name: Some("String".to_string()),
+                    of_type: None,
+                },
+            });
+        let products_type = schema.types.get("Products").unwrap();
+        let selection = smart_select_fields(&schema, products_type, 0);
+        assert!(!selection.contains("needs_arg"));
     }
 }
