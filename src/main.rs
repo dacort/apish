@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod graphql;
 mod openapi;
 mod repl;
 
