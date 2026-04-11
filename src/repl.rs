@@ -28,6 +28,14 @@ const HTTP_COMMANDS: &[&str] = &[
 struct CompletionState {
     endpoint_paths: Vec<String>,
     api_names: Vec<String>,
+    /// For GraphQL: navigable field names from the current cd'd location.
+    graphql_field_names: Vec<String>,
+    /// For GraphQL: arg names for the current cd'd field.
+    graphql_arg_names: Vec<String>,
+    /// For GraphQL: all type names in the schema.
+    graphql_type_names: Vec<String>,
+    /// True if the currently-active API is GraphQL.
+    is_graphql: bool,
 }
 
 struct ApiHelper {
@@ -64,7 +72,7 @@ impl Completer for ApiHelper {
 
         let cmd = parts[0];
 
-        // Complete API names after "use"
+        // `use <api>`
         if cmd == "use" {
             let prefix = if parts.len() > 1 && !line_up_to_cursor.ends_with(' ') {
                 parts[1]
@@ -84,7 +92,71 @@ impl Completer for ApiHelper {
             return Ok((start, matches));
         }
 
-        // Complete endpoint paths after HTTP commands
+        // `describe <Type>`
+        if cmd == "describe" {
+            let prefix = if parts.len() > 1 && !line_up_to_cursor.ends_with(' ') {
+                parts[1]
+            } else {
+                ""
+            };
+            let start = line_up_to_cursor.rfind(prefix).unwrap_or(pos);
+            let matches: Vec<Pair> = state
+                .graphql_type_names
+                .iter()
+                .filter(|n| n.starts_with(prefix))
+                .map(|n| Pair {
+                    display: n.clone(),
+                    replacement: n.clone(),
+                })
+                .collect();
+            return Ok((start, matches));
+        }
+
+        // `cd <field>` for GraphQL
+        if cmd == "cd" && state.is_graphql {
+            let prefix = if parts.len() > 1 && !line_up_to_cursor.ends_with(' ') {
+                parts[1]
+            } else {
+                ""
+            };
+            let start = line_up_to_cursor.rfind(prefix).unwrap_or(pos);
+            let matches: Vec<Pair> = state
+                .graphql_field_names
+                .iter()
+                .filter(|n| n.starts_with(prefix))
+                .map(|n| Pair {
+                    display: n.clone(),
+                    replacement: n.clone(),
+                })
+                .collect();
+            return Ok((start, matches));
+        }
+
+        // `query` / `mutate` arg names
+        if (cmd == "query" || cmd == "mutate") && state.is_graphql {
+            let last_token = if line_up_to_cursor.ends_with(' ') {
+                ""
+            } else {
+                parts.last().copied().unwrap_or("")
+            };
+            // Don't complete if user is typing the value half (after ':')
+            if last_token.contains(':') {
+                return Ok((pos, Vec::new()));
+            }
+            let start = line_up_to_cursor.rfind(last_token).unwrap_or(pos);
+            let matches: Vec<Pair> = state
+                .graphql_arg_names
+                .iter()
+                .filter(|n| n.starts_with(last_token))
+                .map(|n| Pair {
+                    display: format!("{}:", n),
+                    replacement: format!("{}:", n),
+                })
+                .collect();
+            return Ok((start, matches));
+        }
+
+        // REST: complete endpoint paths after HTTP commands or `cd`
         if HTTP_COMMANDS.contains(&cmd) || cmd == "cd" {
             let prefix = if parts.len() > 1 && !line_up_to_cursor.ends_with(' ') {
                 parts[1]
@@ -442,20 +514,50 @@ impl ReplContext {
 
     fn update_completion_state(&self) {
         let mut paths = Vec::new();
+        let mut gql_fields = Vec::new();
+        let mut gql_args = Vec::new();
+        let mut gql_types = Vec::new();
+        let mut is_gql = false;
 
         if let Some(api_name) = &self.current_api {
-            // Add OpenAPI endpoint paths
-            if let Some(endpoints) = self.openapi_endpoints.get(api_name) {
-                for ep in endpoints {
-                    paths.push(ep.path.clone());
-                }
-            }
+            is_gql = self.is_graphql_api(api_name);
 
-            // Add configured endpoint paths
-            if let Some(config) = self.apis.get(api_name) {
-                for ep in &config.endpoints {
-                    if !paths.contains(ep) {
-                        paths.push(ep.clone());
+            if is_gql {
+                if let Some(schema) = self.graphql_schemas.get(api_name) {
+                    // Type names always available
+                    gql_types = schema.types.keys().cloned().collect();
+
+                    // Field names + arg names depend on current path
+                    if let Some(nav) = crate::graphql::resolve_path(schema, &self.current_path) {
+                        match nav {
+                            crate::graphql::Navigation::Root => {
+                                if let Some(qt) = schema.types.get(&schema.query_type) {
+                                    gql_fields.extend(qt.fields.iter().map(|f| f.name.clone()));
+                                }
+                            }
+                            crate::graphql::Navigation::Field { field, .. } => {
+                                gql_args = field.args.iter().map(|a| a.name.clone()).collect();
+                                if let Some(name) = field.type_ref.unwrap_name()
+                                    && let Some(rt) = schema.types.get(name)
+                                {
+                                    gql_fields = rt.fields.iter().map(|f| f.name.clone()).collect();
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Existing REST behavior
+                if let Some(endpoints) = self.openapi_endpoints.get(api_name) {
+                    for ep in endpoints {
+                        paths.push(ep.path.clone());
+                    }
+                }
+                if let Some(config) = self.apis.get(api_name) {
+                    for ep in &config.endpoints {
+                        if !paths.contains(ep) {
+                            paths.push(ep.clone());
+                        }
                     }
                 }
             }
@@ -464,6 +566,10 @@ impl ReplContext {
         let mut state = self.completion_state.lock().unwrap();
         state.endpoint_paths = paths;
         state.api_names = self.apis.keys().cloned().collect();
+        state.graphql_field_names = gql_fields;
+        state.graphql_arg_names = gql_args;
+        state.graphql_type_names = gql_types;
+        state.is_graphql = is_gql;
     }
 
     fn change_path(&mut self, args: &[&str]) -> Result<()> {
@@ -1133,6 +1239,10 @@ pub fn start(config_dir: PathBuf, adhoc_api: Option<ApiConfig>) -> Result<()> {
     let completion_state = Arc::new(Mutex::new(CompletionState {
         endpoint_paths: Vec::new(),
         api_names: Vec::new(),
+        graphql_field_names: Vec::new(),
+        graphql_arg_names: Vec::new(),
+        graphql_type_names: Vec::new(),
+        is_graphql: false,
     }));
 
     let mut ctx = ReplContext::new(config_dir, Arc::clone(&completion_state))?;
