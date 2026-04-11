@@ -758,6 +758,13 @@ impl ReplContext {
             .as_ref()
             .ok_or_else(|| anyhow!("No API selected. Use 'use <api>' first."))?;
 
+        if self.is_graphql_api(api_name) {
+            return Err(anyhow!(
+                "{} is a GraphQL API — use 'query' or 'mutate' instead. Type 'help' for details.",
+                api_name
+            ));
+        }
+
         let config = self.apis.get(api_name).unwrap();
 
         // Parse path and body
