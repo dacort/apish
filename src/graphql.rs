@@ -1,9 +1,10 @@
 use crate::config::{AuthConfig, KeyLocation};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::process::Command;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -329,21 +330,58 @@ fragment TypeRef on __Type {
   }
 }"#;
 
-/// Fetches the schema from a GraphQL endpoint by POSTing the introspection query.
-pub fn fetch_schema(
+#[derive(Debug)]
+struct GraphQLHttpResponse {
+    status: u16,
+    body_text: String,
+    content_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeFetchResponse {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: String,
+}
+
+fn post_graphql_json(
     url: &str,
     headers: &HashMap<String, String>,
     auth: Option<&AuthConfig>,
-) -> Result<GraphQLSchema> {
+    payload: &Value,
+) -> Result<GraphQLHttpResponse> {
+    match post_graphql_with_reqwest(url, headers, auth, payload) {
+        Ok(resp)
+            if looks_like_waf_block(resp.status, resp.content_type.as_deref(), &resp.body_text) =>
+        {
+            post_graphql_with_node(url, headers, auth, payload).with_context(|| {
+                format!(
+                    "GraphQL POST to {} was blocked by an upstream WAF when using reqwest",
+                    url
+                )
+            })
+        }
+        Ok(resp) => Ok(resp),
+        Err(reqwest_err) => {
+            post_graphql_with_node(url, headers, auth, payload).with_context(|| {
+                format!(
+                    "GraphQL POST via reqwest failed: {}. Node fetch fallback also failed",
+                    reqwest_err
+                )
+            })
+        }
+    }
+}
+
+fn post_graphql_with_reqwest(
+    url: &str,
+    headers: &HashMap<String, String>,
+    auth: Option<&AuthConfig>,
+    payload: &Value,
+) -> Result<GraphQLHttpResponse> {
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
 
-    let mut req = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .body(format!(
-            "{{\"query\": {}}}",
-            serde_json::to_string(INTROSPECTION_QUERY)?
-        ));
+    let mut req = client.post(url).header("Content-Type", "application/json");
 
     for (k, v) in headers {
         req = req.header(k, v);
@@ -364,16 +402,145 @@ pub fn fetch_schema(
         };
     }
 
-    let response = req.send()?;
-    if !response.status().is_success() {
+    let response = req.body(serde_json::to_string(payload)?).send()?;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let body_text = response.text()?;
+
+    Ok(GraphQLHttpResponse {
+        status,
+        body_text,
+        content_type,
+    })
+}
+
+fn looks_like_waf_block(status: u16, content_type: Option<&str>, body: &str) -> bool {
+    if status != 403 && status != 406 && status != 429 && status != 503 {
+        return false;
+    }
+
+    let body_lower = body.to_ascii_lowercase();
+    let is_html = content_type
+        .map(|ct| ct.to_ascii_lowercase().contains("text/html"))
+        .unwrap_or(false)
+        || body_lower.contains("<html");
+
+    is_html
+        && (body_lower.contains("access denied")
+            || body_lower.contains("reference #")
+            || body_lower.contains("errors.edgesuite.net"))
+}
+
+fn post_graphql_with_node(
+    url: &str,
+    headers: &HashMap<String, String>,
+    auth: Option<&AuthConfig>,
+    payload: &Value,
+) -> Result<GraphQLHttpResponse> {
+    const NODE_FETCH_SCRIPT: &str = r#"
+const url = new URL(process.env.APISH_GQL_URL);
+const headers = JSON.parse(process.env.APISH_GQL_HEADERS || "{}");
+const auth = JSON.parse(process.env.APISH_GQL_AUTH || "null");
+const body = process.env.APISH_GQL_PAYLOAD || "";
+
+const hasHeader = (name) =>
+  Object.keys(headers).some((key) => key.toLowerCase() === name.toLowerCase());
+
+if (!hasHeader("Content-Type")) {
+  headers["Content-Type"] = "application/json";
+}
+if (!hasHeader("Accept")) {
+  headers["Accept"] = "application/graphql-response+json, application/json";
+}
+
+if (auth) {
+  if (auth.type === "bearer") {
+    headers["Authorization"] = `Bearer ${auth.token}`;
+  } else if (auth.type === "basic") {
+    const token = Buffer.from(`${auth.username}:${auth.password}`).toString("base64");
+    headers["Authorization"] = `Basic ${token}`;
+  } else if (auth.type === "apikey") {
+    if (auth.location === "header") {
+      headers[auth.name] = auth.value;
+    } else if (auth.location === "query") {
+      url.searchParams.set(auth.name, auth.value);
+    }
+  }
+}
+
+fetch(url, { method: "POST", headers, body })
+  .then(async (response) => {
+    const responseBody = await response.text();
+    process.stdout.write(
+      JSON.stringify({
+        status: response.status,
+        headers: Object.fromEntries(response.headers.entries()),
+        body: responseBody,
+      }),
+    );
+  })
+  .catch((error) => {
+    console.error(error && error.stack ? error.stack : String(error));
+    process.exit(1);
+  });
+"#;
+
+    let output = Command::new("node")
+        .arg("-e")
+        .arg(NODE_FETCH_SCRIPT)
+        .env("APISH_GQL_URL", url)
+        .env("APISH_GQL_HEADERS", serde_json::to_string(headers)?)
+        .env("APISH_GQL_AUTH", serde_json::to_string(&auth)?)
+        .env("APISH_GQL_PAYLOAD", serde_json::to_string(payload)?)
+        .output()
+        .context("failed to spawn node for GraphQL fallback")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!(
-            "introspection failed with status {}",
-            response.status()
+            "node fetch exited with status {}: {}",
+            output.status,
+            stderr.trim()
         ));
     }
 
-    let body = response.text()?;
-    parse_introspection(&body)
+    let response: NodeFetchResponse =
+        serde_json::from_slice(&output.stdout).with_context(|| {
+            format!(
+                "node fetch returned invalid JSON: {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })?;
+
+    Ok(GraphQLHttpResponse {
+        status: response.status,
+        body_text: response.body,
+        content_type: response.headers.get("content-type").cloned(),
+    })
+}
+
+/// Fetches the schema from a GraphQL endpoint by POSTing the introspection query.
+pub fn fetch_schema(
+    url: &str,
+    headers: &HashMap<String, String>,
+    auth: Option<&AuthConfig>,
+) -> Result<GraphQLSchema> {
+    let payload = serde_json::json!({
+        "query": INTROSPECTION_QUERY,
+    });
+    let response = post_graphql_json(url, headers, auth, &payload)?;
+    if response.status < 200 || response.status >= 300 {
+        return Err(anyhow!(
+            "introspection failed with status {}",
+            response.status
+        ));
+    }
+
+    parse_introspection(&response.body_text)
 }
 
 /// Where the user currently "is" within a GraphQL schema.
@@ -431,29 +598,18 @@ pub fn resolve_path<'a>(schema: &'a GraphQLSchema, path: &str) -> Option<Navigat
 
 /// Quick check: does this URL respond to a GraphQL introspection query with a valid schema?
 pub fn detect_graphql(url: &str) -> bool {
-    let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
-        Ok(c) => c,
+    let payload = serde_json::json!({
+        "query": "{ __schema { queryType { name } } }",
+    });
+    let response = match post_graphql_json(url, &HashMap::new(), None, &payload) {
+        Ok(resp) => resp,
         Err(_) => return false,
     };
-    let body = format!("{{\"query\": \"{{ __schema {{ queryType {{ name }} }} }}\"}}");
-    let resp = match client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .body(body)
-        .send()
-    {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
-    if !resp.status().is_success() {
+    if response.status < 200 || response.status >= 300 {
         return false;
     }
-    let text = match resp.text() {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
     // Look for the structural marker
-    text.contains("\"__schema\"") && text.contains("\"queryType\"")
+    response.body_text.contains("\"__schema\"") && response.body_text.contains("\"queryType\"")
 }
 
 /// Parses CLI-style key:value args (with dot notation for nesting) into a JSON object.
@@ -777,39 +933,13 @@ pub fn execute_query(
     auth: Option<&AuthConfig>,
     built: &BuiltQuery,
 ) -> Result<(u16, Value)> {
-    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
-
     let payload = serde_json::json!({
         "query": built.query,
         "variables": built.variables,
     });
-
-    let mut req = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .body(serde_json::to_string(&payload)?);
-
-    for (k, v) in headers {
-        req = req.header(k, v);
-    }
-    if let Some(auth) = auth {
-        req = match auth {
-            AuthConfig::Bearer { token } => req.bearer_auth(token),
-            AuthConfig::ApiKey {
-                name,
-                value,
-                location,
-            } => match location {
-                KeyLocation::Header => req.header(name, value),
-                KeyLocation::Query => req.query(&[(name, value)]),
-            },
-            AuthConfig::Basic { username, password } => req.basic_auth(username, Some(password)),
-        };
-    }
-
-    let response = req.send()?;
-    let status = response.status().as_u16();
-    let body_text = response.text()?;
+    let response = post_graphql_json(url, headers, auth, &payload)?;
+    let status = response.status;
+    let body_text = response.body_text;
     let body: Value =
         serde_json::from_str(&body_text).unwrap_or_else(|_| Value::String(body_text.clone()));
     Ok((status, body))
@@ -911,6 +1041,18 @@ mod tests {
         assert_eq!(query_type.fields.len(), 1);
         assert_eq!(query_type.fields[0].name, "hello");
         assert_eq!(query_type.fields[0].type_ref.render(), "String");
+    }
+
+    #[test]
+    fn detects_akamai_style_waf_block_pages() {
+        let body = r#"<html><body><h1>Access Denied</h1>Reference #18.14793517.1775919278.92db5eec https://errors.edgesuite.net/</body></html>"#;
+        assert!(looks_like_waf_block(403, Some("text/html"), body));
+    }
+
+    #[test]
+    fn does_not_treat_json_403_as_waf_block() {
+        let body = r#"{"errors":[{"message":"forbidden"}]}"#;
+        assert!(!looks_like_waf_block(403, Some("application/json"), body));
     }
 
     fn schema_with_products() -> GraphQLSchema {
