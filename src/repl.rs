@@ -212,6 +212,7 @@ impl ReplContext {
             "config" => self.show_config()?,
             ":w" => self.save_config(&parts[1..])?,
             "describe" => self.describe_type(&parts[1..])?,
+            "query" => self.do_query(&parts[1..])?,
             _ => println!(
                 "{} Unknown command: {}. Type 'help' for available commands.",
                 "✗".red(),
@@ -880,6 +881,143 @@ impl ReplContext {
         config.save_to_file(path)?;
         println!("{} Saved config to {}", "✓".green(), filename);
         Ok(())
+    }
+
+    fn do_query(&mut self, args: &[&str]) -> Result<()> {
+        let api_name = self
+            .current_api
+            .as_ref()
+            .ok_or_else(|| anyhow!("No API selected"))?
+            .clone();
+
+        if !self.is_graphql_api(&api_name) {
+            return Err(anyhow!(
+                "{} is a REST API — use 'get'/'post'/etc instead",
+                api_name
+            ));
+        }
+
+        let field_name = self
+            .current_path
+            .trim_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+
+        if field_name.is_empty() {
+            return Err(anyhow!("cd into a query field first (e.g., `cd products`)"));
+        }
+
+        let (parsed_args, selection) = split_query_args(args)?;
+
+        // Scope the schema borrow so it ends before we mutably borrow self.history
+        let built = {
+            let schema = self
+                .graphql_schemas
+                .get(&api_name)
+                .ok_or_else(|| anyhow!("GraphQL schema not loaded"))?;
+
+            let nav = crate::graphql::resolve_path(schema, &self.current_path)
+                .ok_or_else(|| anyhow!("invalid current path: {}", self.current_path))?;
+
+            let field = match nav {
+                crate::graphql::Navigation::Field { field, .. } => field,
+                crate::graphql::Navigation::Root => {
+                    return Err(anyhow!("cd into a query field first (e.g., `cd products`)"));
+                }
+            };
+
+            crate::graphql::build_query(
+                &field_name,
+                field,
+                &parsed_args,
+                selection.as_deref(),
+                schema,
+            )?
+        };
+
+        // Extract owned config values so we don't hold a borrow on self.apis
+        let (url, headers, auth) = {
+            let config = self.apis.get(&api_name).unwrap();
+            (
+                config.base_url.clone(),
+                config.headers.clone(),
+                config.auth.clone(),
+            )
+        };
+
+        println!("{} {}", "→".blue(), built.query.dimmed());
+
+        let (status, body) = crate::graphql::execute_query(&url, &headers, auth.as_ref(), &built)?;
+
+        print_graphql_response(status, &body);
+
+        // History — safe now, no outstanding borrows on self
+        self.history
+            .add_entry(api_name, "QUERY".to_string(), field_name, Some(status));
+        let _ = self.save_history();
+
+        Ok(())
+    }
+
+}
+
+fn split_query_args(
+    args: &[&str],
+) -> Result<(serde_json::Map<String, serde_json::Value>, Option<String>)> {
+    let mut kv_tokens: Vec<&str> = Vec::new();
+    let mut selection: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--fields" {
+            if i + 1 >= args.len() {
+                return Err(anyhow!("--fields requires a value"));
+            }
+            // Selection may contain spaces if user wrote it across tokens; rejoin remaining
+            let rest = args[i + 1..].join("");
+            selection = Some(crate::graphql::parse_field_selection(&rest)?);
+            break;
+        } else {
+            kv_tokens.push(args[i]);
+            i += 1;
+        }
+    }
+    let parsed = crate::graphql::parse_args(&kv_tokens)?;
+    Ok((parsed, selection))
+}
+
+fn print_graphql_response(status: u16, body: &serde_json::Value) {
+    let status_color = if (200..300).contains(&status) {
+        "green"
+    } else {
+        "red"
+    };
+    println!("{}", format!("{}", status).color(status_color).bold());
+    println!();
+
+    // Check for GraphQL-level errors
+    if let Some(errors) = body.get("errors")
+        && let Some(arr) = errors.as_array()
+        && !arr.is_empty()
+    {
+        println!("{}", "GraphQL errors:".red().bold());
+        for err in arr {
+            if let Some(msg) = err.get("message").and_then(|m| m.as_str()) {
+                println!("  {} {}", "✗".red(), msg);
+            } else {
+                println!("  {} {}", "✗".red(), err);
+            }
+        }
+        println!();
+    }
+
+    if let Some(data) = body.get("data") {
+        println!("{}", serde_json::to_string_pretty(data).unwrap());
+        println!();
+    } else if !body.is_null() {
+        println!("{}", serde_json::to_string_pretty(body).unwrap());
+        println!();
     }
 }
 

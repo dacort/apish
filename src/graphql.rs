@@ -770,6 +770,51 @@ fn build_operation(
     Ok(BuiltQuery { query, variables })
 }
 
+/// Executes a BuiltQuery against the configured endpoint and returns the parsed response body.
+pub fn execute_query(
+    url: &str,
+    headers: &HashMap<String, String>,
+    auth: Option<&AuthConfig>,
+    built: &BuiltQuery,
+) -> Result<(u16, Value)> {
+    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+
+    let payload = serde_json::json!({
+        "query": built.query,
+        "variables": built.variables,
+    });
+
+    let mut req = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_string(&payload)?);
+
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    if let Some(auth) = auth {
+        req = match auth {
+            AuthConfig::Bearer { token } => req.bearer_auth(token),
+            AuthConfig::ApiKey {
+                name,
+                value,
+                location,
+            } => match location {
+                KeyLocation::Header => req.header(name, value),
+                KeyLocation::Query => req.query(&[(name, value)]),
+            },
+            AuthConfig::Basic { username, password } => req.basic_auth(username, Some(password)),
+        };
+    }
+
+    let response = req.send()?;
+    let status = response.status().as_u16();
+    let body_text = response.text()?;
+    let body: Value =
+        serde_json::from_str(&body_text).unwrap_or_else(|_| Value::String(body_text.clone()));
+    Ok((status, body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
