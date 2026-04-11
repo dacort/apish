@@ -4,6 +4,8 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use wreq::Client as EmulatedClient;
@@ -339,16 +341,45 @@ struct GraphQLHttpResponse {
     content_type: Option<String>,
 }
 
+fn waf_fallback_cache() -> &'static Mutex<HashSet<String>> {
+    static CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn should_use_waf_fallback(url: &str) -> bool {
+    waf_fallback_cache()
+        .lock()
+        .expect("waf fallback cache poisoned")
+        .contains(url)
+}
+
+fn remember_waf_fallback(url: &str) {
+    waf_fallback_cache()
+        .lock()
+        .expect("waf fallback cache poisoned")
+        .insert(url.to_string());
+}
+
 fn post_graphql_json(
     url: &str,
     headers: &HashMap<String, String>,
     auth: Option<&AuthConfig>,
     payload: &Value,
 ) -> Result<GraphQLHttpResponse> {
+    if should_use_waf_fallback(url) {
+        return post_graphql_with_wreq(url, headers, auth, payload).with_context(|| {
+            format!(
+                "GraphQL POST to {} is using cached browser-emulated fallback",
+                url
+            )
+        });
+    }
+
     match post_graphql_with_reqwest(url, headers, auth, payload) {
         Ok(resp)
             if looks_like_waf_block(resp.status, resp.content_type.as_deref(), &resp.body_text) =>
         {
+            remember_waf_fallback(url);
             post_graphql_with_wreq(url, headers, auth, payload).with_context(|| {
                 format!(
                     "GraphQL POST to {} was blocked by an upstream WAF when using reqwest",
@@ -357,14 +388,12 @@ fn post_graphql_json(
             })
         }
         Ok(resp) => Ok(resp),
-        Err(reqwest_err) => {
-            post_graphql_with_wreq(url, headers, auth, payload).with_context(|| {
-                format!(
-                    "GraphQL POST via reqwest failed: {}. Browser-emulated Rust fallback also failed",
-                    reqwest_err
-                )
-            })
-        }
+        Err(reqwest_err) => post_graphql_with_wreq(url, headers, auth, payload).with_context(|| {
+            format!(
+                "GraphQL POST via reqwest failed: {}. Browser-emulated Rust fallback also failed",
+                reqwest_err
+            )
+        }),
     }
 }
 
@@ -1028,6 +1057,14 @@ mod tests {
     fn detects_akamai_style_waf_block_pages() {
         let body = r#"<html><body><h1>Access Denied</h1>Reference #18.14793517.1775919278.92db5eec https://errors.edgesuite.net/</body></html>"#;
         assert!(looks_like_waf_block(403, Some("text/html"), body));
+    }
+
+    #[test]
+    fn remembers_waf_fallback_by_url() {
+        let url = "https://example.com/graphql";
+        assert!(!should_use_waf_fallback(url));
+        remember_waf_fallback(url);
+        assert!(should_use_waf_fallback(url));
     }
 
     #[test]
