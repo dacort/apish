@@ -299,8 +299,12 @@ impl ReplContext {
             api_name.cyan().bold()
         );
 
-        // Load OpenAPI spec if configured and not already loaded
-        self.load_openapi_for_api(api_name);
+        // Load schema (OpenAPI or GraphQL) if applicable
+        if self.is_graphql_api(api_name) {
+            self.load_graphql_for_api(api_name);
+        } else {
+            self.load_openapi_for_api(api_name);
+        }
 
         Ok(())
     }
@@ -332,6 +336,57 @@ impl ReplContext {
                 Err(e) => {
                     println!("{} Failed to load OpenAPI spec: {}", "✗".red(), e);
                 }
+            }
+        }
+    }
+
+    fn is_graphql_api(&self, api_name: &str) -> bool {
+        self.apis
+            .get(api_name)
+            .and_then(|c| c.graphql)
+            .unwrap_or(false)
+    }
+
+    fn load_graphql_for_api(&mut self, api_name: &str) {
+        if self.graphql_schemas.contains_key(api_name) {
+            self.update_completion_state();
+            return;
+        }
+
+        let (url, headers, auth) = {
+            let config = self.apis.get(api_name).unwrap();
+            (config.base_url.clone(), config.headers.clone(), config.auth.clone())
+        };
+
+        println!("{} Loading GraphQL schema from {}...", "ℹ".blue(), url);
+        match crate::graphql::fetch_schema(&url, &headers, auth.as_ref()) {
+            Ok(schema) => {
+                let q_count = schema
+                    .types
+                    .get(&schema.query_type)
+                    .map(|t| t.fields.len())
+                    .unwrap_or(0);
+                let m_count = schema
+                    .mutation_type
+                    .as_ref()
+                    .and_then(|n| schema.types.get(n))
+                    .map(|t| t.fields.len())
+                    .unwrap_or(0);
+                println!(
+                    "{} Loaded GraphQL schema: {} queries, {} mutations",
+                    "✓".green(),
+                    q_count,
+                    m_count
+                );
+                self.graphql_schemas.insert(api_name.to_string(), schema);
+                self.update_completion_state();
+            }
+            Err(e) => {
+                println!("{} Failed to load GraphQL schema: {}", "✗".red(), e);
+                println!(
+                    "{} Falling back to raw mode (no autocompletion or smart defaults)",
+                    "ℹ".blue()
+                );
             }
         }
     }
@@ -626,8 +681,12 @@ pub fn start(config_dir: PathBuf, adhoc_api: Option<ApiConfig>) -> Result<()> {
         ctx.apis.insert(name.clone(), config);
         ctx.current_api = Some(name.clone());
 
-        // Load OpenAPI spec if configured
-        ctx.load_openapi_for_api(&name);
+        // Load schema if configured
+        if ctx.is_graphql_api(&name) {
+            ctx.load_graphql_for_api(&name);
+        } else {
+            ctx.load_openapi_for_api(&name);
+        }
     }
 
     let rl_config = Config::builder()
