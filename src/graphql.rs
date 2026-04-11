@@ -661,6 +661,115 @@ where
     Ok(parts.join(" "))
 }
 
+/// A built GraphQL query ready to POST.
+#[derive(Debug, Clone)]
+pub struct BuiltQuery {
+    pub query: String,
+    pub variables: Map<String, Value>,
+}
+
+/// Builds a GraphQL query for the given top-level field.
+///
+/// - `field_name`: the name as it appears in the operation (e.g., "products")
+/// - `field_def`: the field's schema definition (used to look up arg types and return type)
+/// - `args`: parsed user arguments (only ones matching declared args are used)
+/// - `selection`: pre-built selection set string (e.g. "{ items { sku } total_count }").
+///   If None, uses smart defaults from the return type.
+/// - `schema`: the full schema (for type lookups)
+pub fn build_query(
+    field_name: &str,
+    field_def: &FieldDef,
+    args: &Map<String, Value>,
+    selection: Option<&str>,
+    schema: &GraphQLSchema,
+) -> Result<BuiltQuery> {
+    build_operation("query", field_name, field_def, args, selection, schema)
+}
+
+pub fn build_mutation(
+    field_name: &str,
+    field_def: &FieldDef,
+    args: &Map<String, Value>,
+    selection: Option<&str>,
+    schema: &GraphQLSchema,
+) -> Result<BuiltQuery> {
+    build_operation("mutation", field_name, field_def, args, selection, schema)
+}
+
+fn build_operation(
+    operation_kind: &str,
+    field_name: &str,
+    field_def: &FieldDef,
+    args: &Map<String, Value>,
+    selection: Option<&str>,
+    schema: &GraphQLSchema,
+) -> Result<BuiltQuery> {
+    // Determine which user-provided args match declared args
+    let mut variable_decls: Vec<String> = Vec::new();
+    let mut call_args: Vec<String> = Vec::new();
+    let mut variables: Map<String, Value> = Map::new();
+
+    for arg_def in &field_def.args {
+        if let Some(value) = args.get(&arg_def.name) {
+            variable_decls.push(format!("${}: {}", arg_def.name, arg_def.type_ref.render()));
+            call_args.push(format!("{}: ${}", arg_def.name, arg_def.name));
+            variables.insert(arg_def.name.clone(), value.clone());
+        }
+    }
+
+    // Reject unknown args
+    for k in args.keys() {
+        if !field_def.args.iter().any(|a| &a.name == k) {
+            return Err(anyhow!(
+                "argument '{}' is not declared on {}",
+                k,
+                field_name
+            ));
+        }
+    }
+
+    // Build the selection set
+    let selection_str = match selection {
+        Some(s) => s.to_string(),
+        None => {
+            let return_name = field_def.type_ref.unwrap_name();
+            match return_name.and_then(|n| schema.types.get(n)) {
+                Some(t) if matches!(t.kind, TypeKind::Object | TypeKind::Interface) => {
+                    smart_select_fields(schema, t, 0)
+                }
+                _ => String::new(), // scalar return — no selection
+            }
+        }
+    };
+
+    let var_decls_str = if variable_decls.is_empty() {
+        String::new()
+    } else {
+        format!("({})", variable_decls.join(", "))
+    };
+
+    let call_args_str = if call_args.is_empty() {
+        String::new()
+    } else {
+        format!("({})", call_args.join(", "))
+    };
+
+    let query = format!(
+        "{op}{vars} {{ {field}{call}{sel} }}",
+        op = operation_kind,
+        vars = var_decls_str,
+        field = field_name,
+        call = call_args_str,
+        sel = if selection_str.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", selection_str)
+        },
+    );
+
+    Ok(BuiltQuery { query, variables })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,6 +1106,26 @@ mod tests {
     fn parse_deeply_nested() {
         let s = parse_field_selection("a{b{c,d}}").unwrap();
         assert_eq!(s, "{ a { b { c d } } }");
+    }
+
+    #[test]
+    fn build_query_with_args_and_smart_fields() {
+        let schema = schema_with_products();
+        let products_field = &schema.types.get("Query").unwrap().fields[0];
+        let mut args = Map::new();
+        args.insert("search".to_string(), Value::String("milk".to_string()));
+
+        let built = build_query("products", products_field, &args, None, &schema).unwrap();
+
+        // Should declare $search:String, call products(search:$search) and select scalars
+        assert!(built.query.contains("$search: String"));
+        assert!(built.query.contains("products(search: $search)"));
+        assert!(built.query.contains("total_count"));
+        assert!(built.query.contains("items"));
+        assert_eq!(
+            built.variables.get("search").unwrap(),
+            &Value::String("milk".to_string())
+        );
     }
 
     #[test]
