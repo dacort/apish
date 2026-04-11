@@ -4,8 +4,10 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::process::Command;
 use std::time::Duration;
+use tokio::runtime::Builder as TokioRuntimeBuilder;
+use wreq::Client as EmulatedClient;
+use wreq_util::Emulation as BrowserEmulation;
 
 #[derive(Debug, Clone)]
 pub struct GraphQLSchema {
@@ -337,13 +339,6 @@ struct GraphQLHttpResponse {
     content_type: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct NodeFetchResponse {
-    status: u16,
-    headers: HashMap<String, String>,
-    body: String,
-}
-
 fn post_graphql_json(
     url: &str,
     headers: &HashMap<String, String>,
@@ -354,7 +349,7 @@ fn post_graphql_json(
         Ok(resp)
             if looks_like_waf_block(resp.status, resp.content_type.as_deref(), &resp.body_text) =>
         {
-            post_graphql_with_node(url, headers, auth, payload).with_context(|| {
+            post_graphql_with_wreq(url, headers, auth, payload).with_context(|| {
                 format!(
                     "GraphQL POST to {} was blocked by an upstream WAF when using reqwest",
                     url
@@ -363,9 +358,9 @@ fn post_graphql_json(
         }
         Ok(resp) => Ok(resp),
         Err(reqwest_err) => {
-            post_graphql_with_node(url, headers, auth, payload).with_context(|| {
+            post_graphql_with_wreq(url, headers, auth, payload).with_context(|| {
                 format!(
-                    "GraphQL POST via reqwest failed: {}. Node fetch fallback also failed",
+                    "GraphQL POST via reqwest failed: {}. Browser-emulated Rust fallback also failed",
                     reqwest_err
                 )
             })
@@ -435,91 +430,77 @@ fn looks_like_waf_block(status: u16, content_type: Option<&str>, body: &str) -> 
             || body_lower.contains("errors.edgesuite.net"))
 }
 
-fn post_graphql_with_node(
+fn post_graphql_with_wreq(
     url: &str,
     headers: &HashMap<String, String>,
     auth: Option<&AuthConfig>,
     payload: &Value,
 ) -> Result<GraphQLHttpResponse> {
-    const NODE_FETCH_SCRIPT: &str = r#"
-const url = new URL(process.env.APISH_GQL_URL);
-const headers = JSON.parse(process.env.APISH_GQL_HEADERS || "{}");
-const auth = JSON.parse(process.env.APISH_GQL_AUTH || "null");
-const body = process.env.APISH_GQL_PAYLOAD || "";
+    let mut target_url = url::Url::parse(url)?;
+    let mut header_auth: Option<(String, String)> = None;
+    let mut basic_auth: Option<(String, String)> = None;
 
-const hasHeader = (name) =>
-  Object.keys(headers).some((key) => key.toLowerCase() === name.toLowerCase());
-
-if (!hasHeader("Content-Type")) {
-  headers["Content-Type"] = "application/json";
-}
-if (!hasHeader("Accept")) {
-  headers["Accept"] = "application/graphql-response+json, application/json";
-}
-
-if (auth) {
-  if (auth.type === "bearer") {
-    headers["Authorization"] = `Bearer ${auth.token}`;
-  } else if (auth.type === "basic") {
-    const token = Buffer.from(`${auth.username}:${auth.password}`).toString("base64");
-    headers["Authorization"] = `Basic ${token}`;
-  } else if (auth.type === "apikey") {
-    if (auth.location === "header") {
-      headers[auth.name] = auth.value;
-    } else if (auth.location === "query") {
-      url.searchParams.set(auth.name, auth.value);
-    }
-  }
-}
-
-fetch(url, { method: "POST", headers, body })
-  .then(async (response) => {
-    const responseBody = await response.text();
-    process.stdout.write(
-      JSON.stringify({
-        status: response.status,
-        headers: Object.fromEntries(response.headers.entries()),
-        body: responseBody,
-      }),
-    );
-  })
-  .catch((error) => {
-    console.error(error && error.stack ? error.stack : String(error));
-    process.exit(1);
-  });
-"#;
-
-    let output = Command::new("node")
-        .arg("-e")
-        .arg(NODE_FETCH_SCRIPT)
-        .env("APISH_GQL_URL", url)
-        .env("APISH_GQL_HEADERS", serde_json::to_string(headers)?)
-        .env("APISH_GQL_AUTH", serde_json::to_string(&auth)?)
-        .env("APISH_GQL_PAYLOAD", serde_json::to_string(payload)?)
-        .output()
-        .context("failed to spawn node for GraphQL fallback")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "node fetch exited with status {}: {}",
-            output.status,
-            stderr.trim()
-        ));
+    if let Some(auth) = auth {
+        match auth {
+            AuthConfig::Bearer { token } => {
+                header_auth = Some(("authorization".to_string(), format!("Bearer {}", token)));
+            }
+            AuthConfig::ApiKey {
+                name,
+                value,
+                location,
+            } => match location {
+                KeyLocation::Header => header_auth = Some((name.clone(), value.clone())),
+                KeyLocation::Query => {
+                    target_url.query_pairs_mut().append_pair(name, value);
+                }
+            },
+            AuthConfig::Basic { username, password } => {
+                basic_auth = Some((username.clone(), password.clone()));
+            }
+        }
     }
 
-    let response: NodeFetchResponse =
-        serde_json::from_slice(&output.stdout).with_context(|| {
-            format!(
-                "node fetch returned invalid JSON: {}",
-                String::from_utf8_lossy(&output.stdout)
-            )
-        })?;
+    let runtime = TokioRuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime for GraphQL WAF fallback")?;
 
-    Ok(GraphQLHttpResponse {
-        status: response.status,
-        body_text: response.body,
-        content_type: response.headers.get("content-type").cloned(),
+    runtime.block_on(async {
+        let client = EmulatedClient::builder()
+            .emulation(BrowserEmulation::Safari26)
+            .build()
+            .context("failed to build browser-emulated HTTP client")?;
+
+        let mut req = client
+            .post(target_url.as_str())
+            .header("Content-Type", "application/json");
+
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+
+        if let Some((name, value)) = &header_auth {
+            req = req.header(name, value);
+        }
+        if let Some((username, password)) = &basic_auth {
+            req = req.basic_auth(username, Some(password));
+        }
+
+        let response = req.body(serde_json::to_vec(payload)?).send().await?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string());
+        let body_text = response.text().await?;
+
+        Ok(GraphQLHttpResponse {
+            status,
+            body_text,
+            content_type,
+        })
     })
 }
 
