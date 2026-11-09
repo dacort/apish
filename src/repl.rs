@@ -1,5 +1,6 @@
 use crate::api::ApiClient;
 use crate::config::{ApiConfig, History};
+use crate::graphql::GraphQLSchema;
 use crate::openapi::{self, EndpointInfo};
 use anyhow::{Result, anyhow};
 use colored::Colorize;
@@ -15,7 +16,8 @@ use std::sync::{Arc, Mutex};
 
 const COMMANDS: &[&str] = &[
     "help", "exit", "quit", "apis", "use", "cd", "pwd", "ls", "get", "post", "put", "delete",
-    "patch", "GET", "POST", "PUT", "DELETE", "PATCH", "history", "config", ":w",
+    "patch", "GET", "POST", "PUT", "DELETE", "PATCH", "history", "config", ":w", "query", "mutate",
+    "describe",
 ];
 
 const HTTP_COMMANDS: &[&str] = &[
@@ -26,6 +28,14 @@ const HTTP_COMMANDS: &[&str] = &[
 struct CompletionState {
     endpoint_paths: Vec<String>,
     api_names: Vec<String>,
+    /// For GraphQL: navigable field names from the current cd'd location.
+    graphql_field_names: Vec<String>,
+    /// For GraphQL: arg names for the current cd'd field.
+    graphql_arg_names: Vec<String>,
+    /// For GraphQL: all type names in the schema.
+    graphql_type_names: Vec<String>,
+    /// True if the currently-active API is GraphQL.
+    is_graphql: bool,
 }
 
 struct ApiHelper {
@@ -62,7 +72,7 @@ impl Completer for ApiHelper {
 
         let cmd = parts[0];
 
-        // Complete API names after "use"
+        // `use <api>`
         if cmd == "use" {
             let prefix = if parts.len() > 1 && !line_up_to_cursor.ends_with(' ') {
                 parts[1]
@@ -82,7 +92,71 @@ impl Completer for ApiHelper {
             return Ok((start, matches));
         }
 
-        // Complete endpoint paths after HTTP commands
+        // `describe <Type>`
+        if cmd == "describe" {
+            let prefix = if parts.len() > 1 && !line_up_to_cursor.ends_with(' ') {
+                parts[1]
+            } else {
+                ""
+            };
+            let start = line_up_to_cursor.rfind(prefix).unwrap_or(pos);
+            let matches: Vec<Pair> = state
+                .graphql_type_names
+                .iter()
+                .filter(|n| n.starts_with(prefix))
+                .map(|n| Pair {
+                    display: n.clone(),
+                    replacement: n.clone(),
+                })
+                .collect();
+            return Ok((start, matches));
+        }
+
+        // `cd <field>` for GraphQL
+        if cmd == "cd" && state.is_graphql {
+            let prefix = if parts.len() > 1 && !line_up_to_cursor.ends_with(' ') {
+                parts[1]
+            } else {
+                ""
+            };
+            let start = line_up_to_cursor.rfind(prefix).unwrap_or(pos);
+            let matches: Vec<Pair> = state
+                .graphql_field_names
+                .iter()
+                .filter(|n| n.starts_with(prefix))
+                .map(|n| Pair {
+                    display: n.clone(),
+                    replacement: n.clone(),
+                })
+                .collect();
+            return Ok((start, matches));
+        }
+
+        // `query` / `mutate` arg names
+        if (cmd == "query" || cmd == "mutate") && state.is_graphql {
+            let last_token = if line_up_to_cursor.ends_with(' ') {
+                ""
+            } else {
+                parts.last().copied().unwrap_or("")
+            };
+            // Don't complete if user is typing the value half (after ':')
+            if last_token.contains(':') {
+                return Ok((pos, Vec::new()));
+            }
+            let start = line_up_to_cursor.rfind(last_token).unwrap_or(pos);
+            let matches: Vec<Pair> = state
+                .graphql_arg_names
+                .iter()
+                .filter(|n| n.starts_with(last_token))
+                .map(|n| Pair {
+                    display: format!("{}:", n),
+                    replacement: format!("{}:", n),
+                })
+                .collect();
+            return Ok((start, matches));
+        }
+
+        // REST: complete endpoint paths after HTTP commands or `cd`
         if HTTP_COMMANDS.contains(&cmd) || cmd == "cd" {
             let prefix = if parts.len() > 1 && !line_up_to_cursor.ends_with(' ') {
                 parts[1]
@@ -121,6 +195,7 @@ pub struct ReplContext {
     current_path: String,
     history: History,
     openapi_endpoints: HashMap<String, Vec<EndpointInfo>>,
+    graphql_schemas: HashMap<String, GraphQLSchema>,
     completion_state: Arc<Mutex<CompletionState>>,
 }
 
@@ -152,6 +227,7 @@ impl ReplContext {
             current_path: "/".to_string(),
             history,
             openapi_endpoints: HashMap::new(),
+            graphql_schemas: HashMap::new(),
             completion_state,
         })
     }
@@ -180,9 +256,25 @@ impl ReplContext {
             "exit" | "quit" => return Ok(false),
             "apis" => self.list_apis(),
             "use" => self.use_api(&parts[1..])?,
-            "cd" => self.change_path(&parts[1..])?,
+            "cd" => {
+                if let Some(api) = &self.current_api.clone()
+                    && self.is_graphql_api(api)
+                {
+                    self.change_graphql_path(&parts[1..])?;
+                } else {
+                    self.change_path(&parts[1..])?;
+                }
+            }
             "pwd" => println!("{}", self.current_path),
-            "ls" => self.list_endpoints()?,
+            "ls" => {
+                if let Some(api) = &self.current_api.clone()
+                    && self.is_graphql_api(api)
+                {
+                    self.list_graphql()?;
+                } else {
+                    self.list_endpoints()?;
+                }
+            }
             "get" | "GET" => self.http_request("GET", &parts[1..])?,
             "post" | "POST" => self.http_request("POST", &parts[1..])?,
             "put" | "PUT" => self.http_request("PUT", &parts[1..])?,
@@ -191,6 +283,9 @@ impl ReplContext {
             "history" => self.show_history(),
             "config" => self.show_config()?,
             ":w" => self.save_config(&parts[1..])?,
+            "describe" => self.describe_type(&parts[1..])?,
+            "query" => self.do_query(&parts[1..])?,
+            "mutate" => self.do_mutate(&parts[1..])?,
             _ => println!(
                 "{} Unknown command: {}. Type 'help' for available commands.",
                 "✗".red(),
@@ -202,6 +297,12 @@ impl ReplContext {
     }
 
     fn show_help(&self) {
+        let is_graphql = self
+            .current_api
+            .as_ref()
+            .map(|n| self.is_graphql_api(n))
+            .unwrap_or(false);
+
         println!("{}", "Available commands:".bold());
         println!();
         println!("  {}  - Display this help message", "help".yellow());
@@ -216,24 +317,77 @@ impl ReplContext {
         );
         println!("  {}   - Show current path", "pwd".yellow());
         println!(
-            "  {}    - List available endpoints for current API",
+            "  {}    - List endpoints / schema fields for current API",
             "ls".yellow()
         );
         println!();
-        println!("  {}  - Make a GET request", "get <path>".yellow());
-        println!(
-            "  {} - Make a POST request with JSON body",
-            "post <path> <json>".yellow()
-        );
-        println!(
-            "  {}  - Make a PUT request with JSON body",
-            "put <path> <json>".yellow()
-        );
-        println!(
-            "  {} - Make a PATCH request with JSON body",
-            "patch <path> <json>".yellow()
-        );
-        println!("  {} - Make a DELETE request", "delete <path>".yellow());
+
+        if is_graphql {
+            println!("{}", "GraphQL commands:".bold());
+            println!(
+                "  {} - Run a query on the cd'd field",
+                "query [args] [--fields ...]".yellow()
+            );
+            println!(
+                "  {} - Run a mutation by name",
+                "mutate <name> [args] [--fields ...]".yellow()
+            );
+            println!(
+                "  {}        - Show all fields of a type",
+                "describe <Type>".yellow()
+            );
+            println!();
+            println!("{}", "GraphQL notes:".bold());
+            println!(
+                "  Nested input args use dot notation, e.g. {}",
+                "filter.code.eq:US".cyan()
+            );
+            println!(
+                "  Bare strings are allowed when unambiguous, e.g. {}",
+                "search:milk".cyan()
+            );
+            println!(
+                "  Select response fields with {}, e.g. {}",
+                "--fields".yellow(),
+                "query filter.code.eq:US --fields code,name,capital".cyan()
+            );
+            println!(
+                "  Use {} to inspect input objects and operator types",
+                "describe <Type>".yellow()
+            );
+
+            if let Some(api_name) = &self.current_api
+                && let Some(schema) = self.graphql_schemas.get(api_name)
+                && let Some(crate::graphql::Navigation::Field {
+                    field, field_name, ..
+                }) = crate::graphql::resolve_path(schema, &self.current_path)
+            {
+                println!();
+                println!("{}", "Current field example:".bold());
+                println!(
+                    "  {}",
+                    crate::graphql::example_command_for_field("query", &field_name, field, schema)
+                        .cyan()
+                );
+            }
+        } else {
+            println!("{}", "REST commands:".bold());
+            println!("  {}  - Make a GET request", "get <path>".yellow());
+            println!(
+                "  {} - Make a POST request with JSON body",
+                "post <path> <json>".yellow()
+            );
+            println!(
+                "  {}  - Make a PUT request with JSON body",
+                "put <path> <json>".yellow()
+            );
+            println!(
+                "  {} - Make a PATCH request with JSON body",
+                "patch <path> <json>".yellow()
+            );
+            println!("  {} - Make a DELETE request", "delete <path>".yellow());
+        }
+
         println!();
         println!("  {} - Show request history", "history".yellow());
         println!("  {} - Show current API configuration", "config".yellow());
@@ -296,8 +450,12 @@ impl ReplContext {
             api_name.cyan().bold()
         );
 
-        // Load OpenAPI spec if configured and not already loaded
-        self.load_openapi_for_api(api_name);
+        // Load schema (OpenAPI or GraphQL) if applicable
+        if self.is_graphql_api(api_name) {
+            self.load_graphql_for_api(api_name);
+        } else {
+            self.load_openapi_for_api(api_name);
+        }
 
         Ok(())
     }
@@ -333,22 +491,107 @@ impl ReplContext {
         }
     }
 
+    fn is_graphql_api(&self, api_name: &str) -> bool {
+        self.apis
+            .get(api_name)
+            .and_then(|c| c.graphql)
+            .unwrap_or(false)
+    }
+
+    fn load_graphql_for_api(&mut self, api_name: &str) {
+        if self.graphql_schemas.contains_key(api_name) {
+            self.update_completion_state();
+            return;
+        }
+
+        let (url, headers, auth) = {
+            let config = self.apis.get(api_name).unwrap();
+            (
+                config.base_url.clone(),
+                config.headers.clone(),
+                config.auth.clone(),
+            )
+        };
+
+        println!("{} Loading GraphQL schema from {}...", "ℹ".blue(), url);
+        match crate::graphql::fetch_schema(&url, &headers, auth.as_ref()) {
+            Ok(schema) => {
+                let q_count = schema
+                    .types
+                    .get(&schema.query_type)
+                    .map(|t| t.fields.len())
+                    .unwrap_or(0);
+                let m_count = schema
+                    .mutation_type
+                    .as_ref()
+                    .and_then(|n| schema.types.get(n))
+                    .map(|t| t.fields.len())
+                    .unwrap_or(0);
+                println!(
+                    "{} Loaded GraphQL schema: {} queries, {} mutations",
+                    "✓".green(),
+                    q_count,
+                    m_count
+                );
+                self.graphql_schemas.insert(api_name.to_string(), schema);
+                self.update_completion_state();
+            }
+            Err(e) => {
+                println!("{} Failed to load GraphQL schema: {}", "✗".red(), e);
+                println!(
+                    "{} Falling back to raw mode (no autocompletion or smart defaults)",
+                    "ℹ".blue()
+                );
+            }
+        }
+    }
+
     fn update_completion_state(&self) {
         let mut paths = Vec::new();
+        let mut gql_fields = Vec::new();
+        let mut gql_args = Vec::new();
+        let mut gql_types = Vec::new();
+        let mut is_gql = false;
 
         if let Some(api_name) = &self.current_api {
-            // Add OpenAPI endpoint paths
-            if let Some(endpoints) = self.openapi_endpoints.get(api_name) {
-                for ep in endpoints {
-                    paths.push(ep.path.clone());
-                }
-            }
+            is_gql = self.is_graphql_api(api_name);
 
-            // Add configured endpoint paths
-            if let Some(config) = self.apis.get(api_name) {
-                for ep in &config.endpoints {
-                    if !paths.contains(ep) {
-                        paths.push(ep.clone());
+            if is_gql {
+                if let Some(schema) = self.graphql_schemas.get(api_name) {
+                    // Type names always available
+                    gql_types = schema.types.keys().cloned().collect();
+
+                    // Field names + arg names depend on current path
+                    if let Some(nav) = crate::graphql::resolve_path(schema, &self.current_path) {
+                        match nav {
+                            crate::graphql::Navigation::Root => {
+                                if let Some(qt) = schema.types.get(&schema.query_type) {
+                                    gql_fields.extend(qt.fields.iter().map(|f| f.name.clone()));
+                                }
+                            }
+                            crate::graphql::Navigation::Field { field, .. } => {
+                                gql_args = field.args.iter().map(|a| a.name.clone()).collect();
+                                if let Some(name) = field.type_ref.unwrap_name()
+                                    && let Some(rt) = schema.types.get(name)
+                                {
+                                    gql_fields = rt.fields.iter().map(|f| f.name.clone()).collect();
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Existing REST behavior
+                if let Some(endpoints) = self.openapi_endpoints.get(api_name) {
+                    for ep in endpoints {
+                        paths.push(ep.path.clone());
+                    }
+                }
+                if let Some(config) = self.apis.get(api_name) {
+                    for ep in &config.endpoints {
+                        if !paths.contains(ep) {
+                            paths.push(ep.clone());
+                        }
                     }
                 }
             }
@@ -357,6 +600,10 @@ impl ReplContext {
         let mut state = self.completion_state.lock().unwrap();
         state.endpoint_paths = paths;
         state.api_names = self.apis.keys().cloned().collect();
+        state.graphql_field_names = gql_fields;
+        state.graphql_arg_names = gql_args;
+        state.graphql_type_names = gql_types;
+        state.is_graphql = is_gql;
     }
 
     fn change_path(&mut self, args: &[&str]) -> Result<()> {
@@ -391,6 +638,67 @@ impl ReplContext {
             self.current_path = new_path;
         }
 
+        Ok(())
+    }
+
+    fn change_graphql_path(&mut self, args: &[&str]) -> Result<()> {
+        let api_name = self
+            .current_api
+            .as_ref()
+            .ok_or_else(|| anyhow!("No API selected"))?
+            .clone();
+
+        let schema = self
+            .graphql_schemas
+            .get(&api_name)
+            .ok_or_else(|| anyhow!("GraphQL schema not loaded"))?;
+
+        let target_path = if args.is_empty() {
+            "/".to_string()
+        } else {
+            let arg = args[0];
+            if arg == "/" {
+                "/".to_string()
+            } else if arg == ".." {
+                let parts: Vec<&str> = self
+                    .current_path
+                    .trim_end_matches('/')
+                    .rsplitn(2, '/')
+                    .collect();
+                let mut p = if parts.len() > 1 {
+                    parts[1].to_string()
+                } else {
+                    "/".to_string()
+                };
+                if p.is_empty() {
+                    p = "/".to_string();
+                }
+                p
+            } else if arg.starts_with('/') {
+                arg.to_string()
+            } else {
+                let mut p = self.current_path.trim_end_matches('/').to_string();
+                p.push('/');
+                p.push_str(arg);
+                p
+            }
+        };
+
+        // Validate the path resolves
+        if crate::graphql::resolve_path(schema, &target_path).is_none() {
+            return Err(anyhow!("path does not exist in schema: {}", target_path));
+        }
+
+        self.current_path = target_path;
+        self.update_completion_state();
+        if let Some(crate::graphql::Navigation::Field {
+            field, field_name, ..
+        }) = crate::graphql::resolve_path(schema, &self.current_path)
+        {
+            let example =
+                crate::graphql::example_command_for_field("query", &field_name, field, schema);
+            println!("{} Example: {}", "ℹ".blue(), example.cyan());
+        }
         Ok(())
     }
 
@@ -470,11 +778,165 @@ impl ReplContext {
         Ok(())
     }
 
+    fn list_graphql(&self) -> Result<()> {
+        let api_name = self
+            .current_api
+            .as_ref()
+            .ok_or_else(|| anyhow!("No API selected. Use 'use <api>' first."))?;
+
+        let schema = self
+            .graphql_schemas
+            .get(api_name)
+            .ok_or_else(|| anyhow!("GraphQL schema not loaded for {}", api_name))?;
+
+        match crate::graphql::resolve_path(schema, &self.current_path) {
+            Some(crate::graphql::Navigation::Root) => {
+                // List queries and mutations
+                if let Some(query_type) = schema.types.get(&schema.query_type) {
+                    println!("{}", "Queries:".bold());
+                    let display_limit = 15;
+                    for (i, field) in query_type.fields.iter().enumerate() {
+                        if i >= display_limit {
+                            println!(
+                                "  {} ({} more — use `ls -a` for all)",
+                                "...".dimmed(),
+                                query_type.fields.len() - display_limit
+                            );
+                            break;
+                        }
+                        let args: Vec<String> = field.args.iter().map(|a| a.name.clone()).collect();
+                        let arg_str = if args.is_empty() {
+                            String::new()
+                        } else {
+                            format!("({})", args.join(", "))
+                        };
+                        println!(
+                            "  {}{} → {}",
+                            field.name.green(),
+                            arg_str.dimmed(),
+                            field.type_ref.render().yellow()
+                        );
+                    }
+                    println!();
+                }
+
+                if let Some(mut_name) = &schema.mutation_type
+                    && let Some(mut_type) = schema.types.get(mut_name)
+                {
+                    println!("{}", "Mutations:".bold());
+                    let display_limit = 15;
+                    for (i, field) in mut_type.fields.iter().enumerate() {
+                        if i >= display_limit {
+                            println!(
+                                "  {} ({} more — use `ls -a` for all)",
+                                "...".dimmed(),
+                                mut_type.fields.len() - display_limit
+                            );
+                            break;
+                        }
+                        println!("  {}", field.name.green());
+                    }
+                    println!();
+                }
+            }
+            Some(crate::graphql::Navigation::Field { field, .. }) => {
+                // Show args + return type fields
+                if !field.args.is_empty() {
+                    println!("{}", "Arguments:".bold());
+                    for arg in &field.args {
+                        println!("  {}: {}", arg.name.cyan(), arg.type_ref.render().yellow());
+                    }
+                    println!();
+                }
+
+                let return_type_name = field.type_ref.unwrap_name();
+                if let Some(name) = return_type_name
+                    && let Some(return_type) = schema.types.get(name)
+                {
+                    println!(
+                        "{} ({})",
+                        format!("Returns {}:", name).bold(),
+                        format!("{:?}", return_type.kind).dimmed()
+                    );
+                    for f in &return_type.fields {
+                        println!("  {} → {}", f.name.green(), f.type_ref.render().yellow());
+                    }
+                    println!();
+                }
+            }
+            None => {
+                println!("{} Invalid path: {}", "✗".red(), self.current_path);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn describe_type(&self, args: &[&str]) -> Result<()> {
+        let api_name = self
+            .current_api
+            .as_ref()
+            .ok_or_else(|| anyhow!("No API selected"))?;
+
+        if !self.is_graphql_api(api_name) {
+            return Err(anyhow!("describe is only available for GraphQL APIs"));
+        }
+
+        if args.is_empty() {
+            return Err(anyhow!("Usage: describe <TypeName>"));
+        }
+
+        let schema = self
+            .graphql_schemas
+            .get(api_name)
+            .ok_or_else(|| anyhow!("GraphQL schema not loaded"))?;
+
+        let type_name = args[0];
+        let type_def = schema
+            .types
+            .get(type_name)
+            .ok_or_else(|| anyhow!("Type not found in schema: {}", type_name))?;
+
+        println!(
+            "{} ({})",
+            type_def.name.bold(),
+            format!("{:?}", type_def.kind).dimmed()
+        );
+
+        if !type_def.fields.is_empty() {
+            for f in &type_def.fields {
+                println!("  {} → {}", f.name.green(), f.type_ref.render().yellow());
+            }
+        }
+
+        if !type_def.input_fields.is_empty() {
+            for f in &type_def.input_fields {
+                println!("  {} → {}", f.name.green(), f.type_ref.render().yellow());
+            }
+        }
+
+        if !type_def.enum_values.is_empty() {
+            for v in &type_def.enum_values {
+                println!("  {}", v.green());
+            }
+        }
+
+        println!();
+        Ok(())
+    }
+
     fn http_request(&mut self, method: &str, args: &[&str]) -> Result<()> {
         let api_name = self
             .current_api
             .as_ref()
             .ok_or_else(|| anyhow!("No API selected. Use 'use <api>' first."))?;
+
+        if self.is_graphql_api(api_name) {
+            return Err(anyhow!(
+                "{} is a GraphQL API — use 'query' or 'mutate' instead. Type 'help' for details.",
+                api_name
+            ));
+        }
 
         let config = self.apis.get(api_name).unwrap();
 
@@ -601,12 +1063,228 @@ impl ReplContext {
         println!("{} Saved config to {}", "✓".green(), filename);
         Ok(())
     }
+
+    fn do_query(&mut self, args: &[&str]) -> Result<()> {
+        let api_name = self
+            .current_api
+            .as_ref()
+            .ok_or_else(|| anyhow!("No API selected"))?
+            .clone();
+
+        if !self.is_graphql_api(&api_name) {
+            return Err(anyhow!(
+                "{} is a REST API — use 'get'/'post'/etc instead",
+                api_name
+            ));
+        }
+
+        let field_name = self
+            .current_path
+            .trim_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+
+        if field_name.is_empty() {
+            return Err(anyhow!("cd into a query field first (e.g., `cd products`)"));
+        }
+
+        let (parsed_args, selection) = split_query_args(args)?;
+
+        // Scope the schema borrow so it ends before we mutably borrow self.history
+        let built = {
+            let schema = self
+                .graphql_schemas
+                .get(&api_name)
+                .ok_or_else(|| anyhow!("GraphQL schema not loaded"))?;
+
+            let nav = crate::graphql::resolve_path(schema, &self.current_path)
+                .ok_or_else(|| anyhow!("invalid current path: {}", self.current_path))?;
+
+            let field = match nav {
+                crate::graphql::Navigation::Field { field, .. } => field,
+                crate::graphql::Navigation::Root => {
+                    return Err(anyhow!("cd into a query field first (e.g., `cd products`)"));
+                }
+            };
+
+            crate::graphql::build_query(
+                &field_name,
+                field,
+                &parsed_args,
+                selection.as_deref(),
+                schema,
+            )?
+        };
+
+        // Extract owned config values so we don't hold a borrow on self.apis
+        let (url, headers, auth) = {
+            let config = self.apis.get(&api_name).unwrap();
+            (
+                config.base_url.clone(),
+                config.headers.clone(),
+                config.auth.clone(),
+            )
+        };
+
+        println!("{} {}", "→".blue(), built.query.dimmed());
+
+        let (status, body) = crate::graphql::execute_query(&url, &headers, auth.as_ref(), &built)?;
+
+        print_graphql_response(status, &body);
+
+        // History — safe now, no outstanding borrows on self
+        self.history
+            .add_entry(api_name, "QUERY".to_string(), field_name, Some(status));
+        let _ = self.save_history();
+
+        Ok(())
+    }
+
+    fn do_mutate(&mut self, args: &[&str]) -> Result<()> {
+        let api_name = self
+            .current_api
+            .as_ref()
+            .ok_or_else(|| anyhow!("No API selected"))?
+            .clone();
+
+        if !self.is_graphql_api(&api_name) {
+            return Err(anyhow!(
+                "{} is a REST API — use 'post'/'put'/etc instead",
+                api_name
+            ));
+        }
+
+        if args.is_empty() {
+            return Err(anyhow!("Usage: mutate <name> [args...] [--fields ...]"));
+        }
+
+        let mutation_name = args[0].to_string();
+        let rest = &args[1..];
+
+        let (parsed_args, selection) = split_query_args(rest)?;
+
+        // Scope the schema borrow so it ends before we mutably borrow self.history
+        let built = {
+            let schema = self
+                .graphql_schemas
+                .get(&api_name)
+                .ok_or_else(|| anyhow!("GraphQL schema not loaded"))?;
+
+            let mut_type_name = schema
+                .mutation_type
+                .as_ref()
+                .ok_or_else(|| anyhow!("schema has no Mutation type"))?;
+            let mut_type = schema
+                .types
+                .get(mut_type_name)
+                .ok_or_else(|| anyhow!("Mutation type not found in schema"))?;
+
+            let field = mut_type
+                .fields
+                .iter()
+                .find(|f| f.name == mutation_name)
+                .ok_or_else(|| anyhow!("mutation not found: {}", mutation_name))?;
+
+            crate::graphql::build_mutation(
+                &mutation_name,
+                field,
+                &parsed_args,
+                selection.as_deref(),
+                schema,
+            )?
+        };
+
+        let (url, headers, auth) = {
+            let config = self.apis.get(&api_name).unwrap();
+            (
+                config.base_url.clone(),
+                config.headers.clone(),
+                config.auth.clone(),
+            )
+        };
+
+        println!("{} {}", "→".blue(), built.query.dimmed());
+
+        let (status, body) = crate::graphql::execute_query(&url, &headers, auth.as_ref(), &built)?;
+
+        print_graphql_response(status, &body);
+
+        self.history
+            .add_entry(api_name, "MUTATE".to_string(), mutation_name, Some(status));
+        let _ = self.save_history();
+
+        Ok(())
+    }
+}
+
+fn split_query_args(
+    args: &[&str],
+) -> Result<(serde_json::Map<String, serde_json::Value>, Option<String>)> {
+    let mut kv_tokens: Vec<&str> = Vec::new();
+    let mut selection: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--fields" {
+            if i + 1 >= args.len() {
+                return Err(anyhow!("--fields requires a value"));
+            }
+            // Selection may contain spaces if user wrote it across tokens; rejoin remaining
+            let rest = args[i + 1..].join("");
+            selection = Some(crate::graphql::parse_field_selection(&rest)?);
+            break;
+        } else {
+            kv_tokens.push(args[i]);
+            i += 1;
+        }
+    }
+    let parsed = crate::graphql::parse_args(&kv_tokens)?;
+    Ok((parsed, selection))
+}
+
+fn print_graphql_response(status: u16, body: &serde_json::Value) {
+    let status_color = if (200..300).contains(&status) {
+        "green"
+    } else {
+        "red"
+    };
+    println!("{}", format!("{}", status).color(status_color).bold());
+    println!();
+
+    // Check for GraphQL-level errors
+    if let Some(errors) = body.get("errors")
+        && let Some(arr) = errors.as_array()
+        && !arr.is_empty()
+    {
+        println!("{}", "GraphQL errors:".red().bold());
+        for err in arr {
+            if let Some(msg) = err.get("message").and_then(|m| m.as_str()) {
+                println!("  {} {}", "✗".red(), msg);
+            } else {
+                println!("  {} {}", "✗".red(), err);
+            }
+        }
+        println!();
+    }
+
+    if let Some(data) = body.get("data") {
+        println!("{}", serde_json::to_string_pretty(data).unwrap());
+        println!();
+    } else if !body.is_null() {
+        println!("{}", serde_json::to_string_pretty(body).unwrap());
+        println!();
+    }
 }
 
 pub fn start(config_dir: PathBuf, adhoc_api: Option<ApiConfig>) -> Result<()> {
     let completion_state = Arc::new(Mutex::new(CompletionState {
         endpoint_paths: Vec::new(),
         api_names: Vec::new(),
+        graphql_field_names: Vec::new(),
+        graphql_arg_names: Vec::new(),
+        graphql_type_names: Vec::new(),
+        is_graphql: false,
     }));
 
     let mut ctx = ReplContext::new(config_dir, Arc::clone(&completion_state))?;
@@ -623,8 +1301,12 @@ pub fn start(config_dir: PathBuf, adhoc_api: Option<ApiConfig>) -> Result<()> {
         ctx.apis.insert(name.clone(), config);
         ctx.current_api = Some(name.clone());
 
-        // Load OpenAPI spec if configured
-        ctx.load_openapi_for_api(&name);
+        // Load schema if configured
+        if ctx.is_graphql_api(&name) {
+            ctx.load_graphql_for_api(&name);
+        } else {
+            ctx.load_openapi_for_api(&name);
+        }
     }
 
     let rl_config = Config::builder()
